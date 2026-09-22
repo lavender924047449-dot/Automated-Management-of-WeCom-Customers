@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+.venv-1/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 日志与运行时产物
+logs/
+*.log
+screenshots/
+
+# runtime/ 目录整体忽略；但下面这几条是"活代码 / 必须入库"，需要白名单穿透
+runtime/
+!runtime/__init__.py
+!runtime/wework_re_android/
+!runtime/wework_re_android/**
+# 这些是 RE 阶段的中间产物，不入库
+runtime/wework_re_android/artifacts/
+runtime/wework_re_android/tmp/
+runtime/wework_re_android/notes/
+
+# 一次性调查工作区
+work/
+# 历史账号/素材数据（含真实运行数据，不入库）
+data/
+
+# 清理阶段临时暂存（归档到 PC_hook_repo 后会删掉）
+_archive_staging/
+
+# 打包产物
+*.spec.bak
+/build/
+/dist/
+!/packaging/*.spec
+
+# 大二进制（不入库，需要时脚本拉或手动放）
+vendor/ffmpeg/*.exe
+vendor/ffmpeg/*.dll
+vendor/adb.exe
+vendor/AdbWinApi.dll
+vendor/AdbWinUsbApi.dll
+vendor/frida-server-*
+vendor/wework_apk/
+
+# 根目录历史遗留
+ui_dump.xml
+dump_*.xml
+button_info.txt
+ready_state.png
+test.wav
+
+# 遗留 spike 归档产物（如果 spikes/ 目录还没删）
+spikes/artifacts/
+spikes/spike*_dumps/
+spikes/**/*.xml
+spikes/**/*.png
+spikes/**/button_info.txt

@@ -1,0 +1,62 @@
+# wecom-voice-blaster 主配置
+# 所有路径都相对于项目根目录（除非绝对路径）
+
+# ---------- 音频预处理 ---------- #
+audio:
+  sample_rate: 48000            # 采样率 (Hz)
+  channels: 1                   # 单声道
+  bit_depth: 16                 # 位深
+  loudnorm_i: -16.0             # 目标响度 (LUFS，微信语音典型值)
+  loudnorm_tp: -1.5             # 峰值上限
+  loudnorm_lra: 11.0            # 响度范围
+  head_padding_ms: 150          # 首部静音填充
+  tail_padding_ms: 200          # 尾部静音填充
+
+# ---------- FFmpeg ---------- #
+ffmpeg:
+  # 二进制查找顺序: bundled_path → PATH
+  bundled_path: "vendor/ffmpeg/ffmpeg.exe"
+
+# ---------- Android 设备 ---------- #
+device:
+  adb_port: 16384               # MuMu Pro 12 默认
+  connect_timeout: 5.0
+  wecom_package: "com.tencent.wework"
+
+# ---------- 定位选择器 (Spike 验证过) ---------- #
+locators:
+  mic_toggle: "com.tencent.wework:id/gif"      # 键盘/语音切换图标
+  hold_button: "com.tencent.wework:id/ijs"     # 按住 说话
+  input_edit: "com.tencent.wework:id/iju"      # 消息输入框
+  home_msg_tab_text: "消息"                    # 底部 tab 名
+  # Stage 4.5.3 (spike 时确认)
+  plus_button: "com.tencent.wework:id/ijh"     # 输入区右下 "+" 图标 (ImageView, 无 desc)
+
+# ---------- 发送时序 ---------- #
+timing:
+  pre_roll_ms: 150              # 按下 → 开始播放 缓冲
+  post_roll_ms: 300             # 播放完 → 松开 缓冲
+  after_send_wait_s: 1.5        # 松开后等企微完成发送
+
+# ---------- 调度 / 防风控 (Stage 4 使用) ---------- #
+schedule:
+  min_interval_s: 8
+  max_interval_s: 25
+  hourly_limit: 50
+  daily_limit: 250
+  working_hours: [9, 20]        # 24 小时制 [start, end)
+
+# ---------- 日志 ---------- #
+logging:
+  level: "INFO"
+  dir: "logs"
+  keep_days: 14
+
+# ---------- PC 企微转发 ---------- #
+pc_wecom:
+  native_hijack: true             # 有 Frida + 企微进程时走 conv_id hijack；失败回退 UIA
+  decoy_target: ""                # 占位联系人显示名（须与 decoy_conv_id 等长单聊）
+  decoy_conv_id: ""               # 例 S:selfuin_peeruin（35 字符）；空则无法 hijack
+  conv_map_file: "runtime/conv_map.json"
+  vtable_offset: "0xabbb210"      # 企微 5.0.10.6015；升版需重逆向
+
