@@ -20,12 +20,14 @@ logs/
 *.log
 screenshots/
 
-# runtime/ 目录整体忽略；但下面这几条是"活代码 / 必须入库"，需要白名单穿透
-runtime/
+# runtime/ 里只入库当前模拟器主链脚本。父目录被整段忽略时，Git 不会再看里面的白名单。
+runtime/*
 !runtime/__init__.py
 !runtime/wework_re_android/
-!runtime/wework_re_android/**
-# 这些是 RE 阶段的中间产物，不入库
+runtime/wework_re_android/*
+!runtime/wework_re_android/*.py
+!runtime/wework_re_android/*.js
+!runtime/wework_re_android/*.json
 runtime/wework_re_android/artifacts/
 runtime/wework_re_android/tmp/
 runtime/wework_re_android/notes/

@@ -22,7 +22,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGING = ROOT / "packaging"
-SPEC_CLI = PACKAGING / "wecom-voice-blaster-cli.spec"
 SPEC_GUI = PACKAGING / "wecom-voice-blaster-gui.spec"
 FFMPEG = ROOT / "vendor" / "ffmpeg" / "ffmpeg.exe"
 FRIDA_SERVER = ROOT / "vendor" / "frida-server-16.7.19-android-x86_64"
@@ -99,9 +98,7 @@ def _prepare_gui_delivery() -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="打包 wecom-voice-blaster")
-    ap.add_argument("--cli-only", action="store_true")
-    ap.add_argument("--gui-only", action="store_true")
+    ap = argparse.ArgumentParser(description="打包企业微信客户消息工具")
     ap.add_argument("--clean", action="store_true",
                     help="先删 build/ dist/ 再打包")
     args = ap.parse_args()
@@ -114,28 +111,14 @@ def main() -> int:
                 shutil.rmtree(p)
 
     _ensure_ffmpeg()
-
-    do_cli = not args.gui_only
-    do_gui = not args.cli_only
-
-    if do_cli:
-        _run_pyinstaller(SPEC_CLI)
-        cli_dir = ROOT / "dist" / "wecom-voice-blaster"
-        readme = PACKAGING / "使用说明.txt"
-        if cli_dir.is_dir() and readme.is_file():
-            shutil.copy2(readme, cli_dir / "使用说明.txt")
-    if do_gui:
-        _run_pyinstaller(SPEC_GUI)
-        _prepare_gui_delivery()
+    _run_pyinstaller(SPEC_GUI)
+    _prepare_gui_delivery()
 
     print("\n[done] 完成. 产物:")
-    if do_cli:
-        print(f"   {ROOT / 'dist' / 'wecom-voice-blaster' / 'wecom-voice-blaster.exe'}")
-    if do_gui:
-        print(f"   {ROOT / 'dist' / GUI_EXE_NAME}")
-        print(f"   {ROOT / 'dist' / 'vendor'}")
-        print(f"   {ROOT / 'dist' / GUI_README_DIST_NAME}")
-        print("   请将 exe、vendor 文件夹、使用说明.txt 放在同一目录后双击 exe。")
+    print(f"   {ROOT / 'dist' / GUI_EXE_NAME}")
+    print(f"   {ROOT / 'dist' / 'vendor'}")
+    print(f"   {ROOT / 'dist' / GUI_README_DIST_NAME}")
+    print("   请将 exe、vendor 文件夹、使用说明.txt 放在同一目录后双击 exe。")
     return 0
 
 

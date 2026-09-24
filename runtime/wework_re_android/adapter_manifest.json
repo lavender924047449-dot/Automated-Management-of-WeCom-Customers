@@ -1,0 +1,12 @@
+{
+  "manifest_version": 1,
+  "wework_version": "5.0.10.6015",
+  "adapter_version": "2026.09.17",
+  "hooks_script": "send_engine_hooks.js",
+  "class_map": {
+    "send_hub": "h8y",
+    "conversation_service": "com.tencent.wework.foundation.logic.ConversationService",
+    "message_manager_hint": "iqy"
+  },
+  "notes": "Base adapter manifest for runtime hook compatibility."
+}

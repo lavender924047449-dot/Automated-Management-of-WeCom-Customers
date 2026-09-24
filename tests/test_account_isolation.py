@@ -153,3 +153,22 @@ def test_read_vid_prefers_latest_entry() -> None:
         return _Proc()
 
     assert account_mod.read_vid_from_wework_prefs(run_fn=fake_run) == "1111111111111"
+
+
+def test_read_vid_falls_back_to_user_info_xml() -> None:
+    import app.broadcast.account as account_mod
+
+    def fake_run(cmd, **_kwargs):
+        class _Proc:
+            returncode = 0
+            stdout = ""
+
+        shell = cmd[-1] if cmd else ""
+        proc = _Proc()
+        if shell.startswith("ls ") and "shared_prefs" in shell and "user_info" not in shell:
+            proc.stdout = "user_info.xml\nBuglySdkInfos.xml\n"
+        elif "user_info.xml" in shell:
+            proc.stdout = '<boolean name="promote_mail_1688855042791155" value="false" />'
+        return proc
+
+    assert account_mod.read_vid_from_wework_prefs(run_fn=fake_run) == "1688855042791155"

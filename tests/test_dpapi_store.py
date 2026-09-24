@@ -7,8 +7,10 @@ from pathlib import Path
 
 import pytest
 
+import base64
+
 from app.security.dpapi_store import DpapiStore
-from app.security.encrypted_json_store import ENC_MARK, EncryptedJsonStore
+from app.security.encrypted_json_store import ENC_BLOB, ENC_MARK, EncryptedJsonStore
 
 
 @pytest.mark.skipif(not DpapiStore.is_available(), reason="win32crypt 不可用")
@@ -51,3 +53,12 @@ print(json.dumps(payload, ensure_ascii=False))
     assert proc.returncode == 0, proc.stderr
     back = json.loads(proc.stdout.strip())
     assert back == payload
+
+
+def test_foreign_dpapi_blob_returns_default(tmp_path: Path):
+    target = tmp_path / "foreign.json"
+    target.write_text(
+        json.dumps({ENC_MARK: "dpapi.v1", ENC_BLOB: base64.b64encode(b"not-from-this-pc").decode("ascii")}),
+        encoding="utf-8",
+    )
+    assert EncryptedJsonStore().load_json(target, default=[]) == []

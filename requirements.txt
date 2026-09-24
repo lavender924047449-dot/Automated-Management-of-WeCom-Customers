@@ -1,11 +1,3 @@
-# 数值与文件处理
-numpy>=2.0.0
-
-# PC 企业微信自动化
-watchdog>=6.0.0
-uiautomation>=2.0.20
-pywinauto>=0.6.9
-
 # 系统与工具
 loguru>=0.7.3
 pydantic>=2.10.0

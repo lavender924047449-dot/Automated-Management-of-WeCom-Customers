@@ -19,12 +19,39 @@ LAST_ACTIVE_ACCOUNT_PATH = Path("data") / "last_active_account.json"
 ACCOUNT_ALIAS_PATH = Path("data") / "account_aliases.json"
 DEFAULT_ADB_SERIAL = "127.0.0.1:16384"
 WEWORK_PREFS_DIR = "/data/data/com.tencent.wework/shared_prefs"
+WEWORK_USER_INFO_XML = f"{WEWORK_PREFS_DIR}/user_info.xml"
+WEWORK_FILECACHE_DIR = "/storage/emulated/0/Android/data/com.tencent.wework/files/filecache"
 _VID_PREFIX_RE = re.compile(r"^(\d{13,})_")
+_PROMOTE_MAIL_RE = re.compile(r"promote_mail_(\d{13,})")
 
 
 def _resolve_adb_binary() -> str:
     """优先使用 bootstrap 记录的 adb 路径。"""
     return os.environ.get("TESTVOICE_ADB_BINARY", "") or "adb"
+
+
+def _adb_shell(
+    shell_cmd: str,
+    *,
+    adb_serial: str,
+    run_fn,
+    timeout_seconds: float,
+) -> str:
+    adb = _resolve_adb_binary()
+    cmd = [adb, "-s", adb_serial, "shell", shell_cmd]
+    try:
+        proc = run_fn(cmd, capture_output=True, text=True, check=False, timeout=timeout_seconds)
+    except Exception:
+        return ""
+    if getattr(proc, "returncode", 1) != 0:
+        return ""
+    return proc.stdout or ""
+
+
+def _pick_most_common(counter: dict[str, int]) -> str:
+    if not counter:
+        return ""
+    return max(counter.items(), key=lambda kv: kv[1])[0]
 
 
 def read_vid_from_wework_prefs(
@@ -33,32 +60,42 @@ def read_vid_from_wework_prefs(
     run_fn=subprocess.run,
     timeout_seconds: float = 6.0,
 ) -> str:
-    """通过 adb 读取企微 shared_prefs 目录，从文件名前缀提取 vid。
+    """通过 adb 读取当前登录 vid，不依赖 Frida。
 
-    企微登录后会在 `/data/data/com.tencent.wework/shared_prefs/` 生成
-    以 `<vid>_...xml` 命名的一系列偏好文件。这条路径不依赖 Frida，
-    只要 adb 有权限读该目录（一般需要 `adb root`）即可命中。
+    依次尝试：
+      1. ``shared_prefs`` 里 ``<vid>_*.xml`` 文件名（老安装常见）。
+      2. ``user_info.xml`` 里的 ``promote_mail_<vid>``（新装企微 5.0.10 常见）。
+      3. ``filecache/<vid>`` 目录名。
+    只要 adb 有 root 读这些路径即可。
     """
-    adb = _resolve_adb_binary()
-    cmd = [adb, "-s", adb_serial, "shell", f"ls {WEWORK_PREFS_DIR} 2>/dev/null"]
-    try:
-        proc = run_fn(cmd, capture_output=True, text=True, check=False, timeout=timeout_seconds)
-    except Exception:
-        return ""
-    if getattr(proc, "returncode", 1) != 0:
-        return ""
-    stdout = proc.stdout or ""
+    kwargs = {
+        "adb_serial": adb_serial,
+        "run_fn": run_fn,
+        "timeout_seconds": timeout_seconds,
+    }
+
     counter: dict[str, int] = {}
-    for name in stdout.splitlines():
-        m = _VID_PREFIX_RE.match(name.strip())
-        if not m:
+    for name in _adb_shell(f"ls {WEWORK_PREFS_DIR} 2>/dev/null", **kwargs).splitlines():
+        match = _VID_PREFIX_RE.match(name.strip())
+        if not match:
             continue
-        vid = m.group(1)
+        vid = match.group(1)
         counter[vid] = counter.get(vid, 0) + 1
-    if not counter:
-        return ""
-    # 选出现次数最多的 vid（多账号切换后可能会残留旧账号的少量文件）。
-    return max(counter.items(), key=lambda kv: kv[1])[0]
+    picked = _pick_most_common(counter)
+    if picked:
+        return picked
+
+    xml = _adb_shell(f"cat {WEWORK_USER_INFO_XML} 2>/dev/null", **kwargs)
+    mail_hits = _PROMOTE_MAIL_RE.findall(xml)
+    if mail_hits:
+        return mail_hits[0]
+
+    cache_counter: dict[str, int] = {}
+    for name in _adb_shell(f"ls {WEWORK_FILECACHE_DIR} 2>/dev/null", **kwargs).splitlines():
+        vid = name.strip().rstrip("/")
+        if re.fullmatch(r"\d{13,}", vid):
+            cache_counter[vid] = cache_counter.get(vid, 0) + 1
+    return _pick_most_common(cache_counter)
 
 
 def get_current_account_id(

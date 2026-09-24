@@ -1,17 +1,13 @@
 [project]
 name = "wecom-voice-blaster"
 version = "0.1.0"
-description = "企业微信素材转发工具（PC 企微 FTA 主链路）"
+description = "企业微信客户消息工具（安卓模拟器 + Frida）"
 requires-python = ">=3.10"
 readme = "README.md"
 
 # 运行时依赖（打包时 pyinstaller 会用 requirements.txt 里的固定下限）
 dependencies = [
-  "numpy>=2.0.0",
-  "watchdog>=6.0.0",
-  "uiautomation>=2.0.20",
-  "pywinauto>=0.6.9",
-  "loguru>=0.7.3",
+    "loguru>=0.7.3",
   "pydantic>=2.10.0",
   "PyYAML>=6.0.2",
   "Pillow>=11.0.0",
@@ -21,14 +17,8 @@ dependencies = [
 ]
 
 # `pip install -e .` 之后, 可直接用这两个入口
-[project.scripts]
-wecom-voice-blaster = "main:main"
-
 [project.gui-scripts]
-wecom-voice-blaster-gui = "main:_gui_entry"
-
-[tool.setuptools]
-py-modules = ["main"]
+wecom-voice-blaster-gui = "gui.main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

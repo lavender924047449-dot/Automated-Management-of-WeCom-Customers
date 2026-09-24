@@ -58,6 +58,12 @@ def install_global_no_window_patch() -> bool:
         # 调用方显式传了 creationflags → 尊重（可能是 CREATE_NEW_CONSOLE 之类）
         if kwargs.get("creationflags") is None or kwargs.get("creationflags") == 0:
             kwargs["creationflags"] = _CREATE_NO_WINDOW
+        # 中文 Windows 上 text=True 默认按 GBK 解码。adb / 设备路径是 UTF-8，
+        # 文件名一带中文，读 stdout 的线程就会 UnicodeDecodeError，采集直接断掉。
+        text_mode = bool(kwargs.get("text") or kwargs.get("universal_newlines"))
+        if text_mode and not kwargs.get("encoding"):
+            kwargs["encoding"] = "utf-8"
+            kwargs.setdefault("errors", "replace")
         return original_init(self, *args, **kwargs)
 
     subprocess.Popen.__init__ = _patched_init  # type: ignore[method-assign]

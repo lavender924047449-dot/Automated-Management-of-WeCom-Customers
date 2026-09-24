@@ -42,14 +42,19 @@ class EncryptedJsonStore:
         target = Path(path)
         if not target.exists():
             return default
-        text = target.read_text(encoding="utf-8").strip()
-        if not text:
+        try:
+            text = target.read_text(encoding="utf-8").strip()
+            if not text:
+                return default
+            parsed = json.loads(text)
+            if self.is_envelope(parsed):
+                plain = self.dpapi.unprotect_from_b64(parsed[ENC_BLOB])
+                return json.loads(plain)
+            return parsed
+        except Exception:
+            # DPAPI 密文绑的是「加密时的那台 Windows 用户」。换电脑或换账号后
+            # CryptUnprotectData 会失败；当成空库，避免采集进程直接退出。
             return default
-        parsed = json.loads(text)
-        if self.is_envelope(parsed):
-            plain = self.dpapi.unprotect_from_b64(parsed[ENC_BLOB])
-            return json.loads(plain)
-        return parsed
 
     def append_jsonl(self, path: str | Path, row: dict[str, Any], *, encrypt: bool = True) -> Path:
         target = Path(path)
@@ -77,7 +82,10 @@ class EncryptedJsonStore:
             line = raw.strip()
             if not line:
                 continue
-            row = self._decode_jsonl_line(line)
+            try:
+                row = self._decode_jsonl_line(line)
+            except Exception:
+                continue
             if isinstance(row, dict):
                 rows.append(row)
         return rows

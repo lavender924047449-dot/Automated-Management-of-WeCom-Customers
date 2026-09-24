@@ -21,11 +21,8 @@ hidden += collect_submodules("app")
 # __runmod__ 动态 importlib.import_module 起来；不显式收集的话打包时 PyInstaller
 # 追不到依赖，运行时子命令直接 ModuleNotFoundError → 联系人/发送/采集全崩。
 hidden += collect_submodules("runtime")
-hidden += collect_submodules("uiautomator2")
-hidden += collect_submodules("adbutils")
 hidden += [
     "loguru", "pydantic", "yaml", "PIL",
-    "sounddevice", "soundfile",
     "PySide6",
     "PySide6.QtCore",
     "PySide6.QtGui",
@@ -37,8 +34,6 @@ hidden += [
 
 datas = [
     (os.path.join(root, "config.yaml"), "."),
-    (os.path.join(root, "samples"), "samples"),
-    (os.path.join(root, "contacts.example.csv"), "."),
 ]
 
 a = Analysis(
