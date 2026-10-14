@@ -18,6 +18,9 @@ def test_at_script_uses_verified_wire_and_waits_for_callback():
     assert r"\u6240\u6709\u4eba " in js
     assert "SetGroupNotification" in js
     assert "SendMessage" in js
+    assert "EngineNoticeCb' + Date.now()" not in js
+    assert "com.testvoice.EngineNoticeCb" in js
+    assert "com.testvoice.EngineAtCb" in js
     branch = js.split("action === 'at' || action === 'notice'", 1)[1]
     assert "sendAtOrNotice(action, String(convId), '大家好');" in branch
     assert branch.index("return;") < branch.index("action=' + action + ' return='")

@@ -78,7 +78,16 @@ Java.perform(function () {
         var FileOutputStream = Java.use('java.io.FileOutputStream');
         var MapCls = Java.use('java.util.Map');
         var JString = Java.use('java.lang.String');
-        var AT_NOTICE_KEEP = [];
+        var engineNoticeCb = null;
+        var engineAtCb = null;
+
+        function callbackSingleton(className, factory) {
+            try {
+                return factory().$new();
+            } catch (eReg) {
+                try { return Java.use(className).$new(); } catch (eUse) { return null; }
+            }
+        }
         var Base64 = Java.use('android.util.Base64');
         var BitmapFactory = Java.use('android.graphics.BitmapFactory');
         var BitmapOptions = Java.use('android.graphics.BitmapFactory$Options');
@@ -312,37 +321,52 @@ Java.perform(function () {
             var CS = Java.use('com.tencent.wework.foundation.logic.ConversationService');
             var svc = CS.getService();
             if (which === 'notice') {
-                var NoticeCb = Java.registerClass({
-                    name: 'com.testvoice.EngineNoticeCb' + Date.now(),
-                    implements: [Java.use('com.tencent.wework.foundation.callback.IConversationOperateCallback2')],
-                    methods: {
-                        onResult: function (code, text, convBack) {
-                            var ok = parseInt(String(code), 10) === 0;
-                            console.log('[send_engine] action=notice code=' + code + ' text=' + text);
-                            console.log('[send_engine] action=notice return=' + ok);
-                        }
-                    }
-                });
-                var noticeCb = NoticeCb.$new();
-                AT_NOTICE_KEEP.push(noticeCb);
-                svc.SetGroupNotification(conv, atNoticeRich([atNoticeTextPart(textBody)]), true, noticeCb);
+                if (!engineNoticeCb) {
+                    engineNoticeCb = callbackSingleton('com.testvoice.EngineNoticeCb', function () {
+                        return Java.registerClass({
+                            name: 'com.testvoice.EngineNoticeCb',
+                            implements: [Java.use('com.tencent.wework.foundation.callback.IConversationOperateCallback2')],
+                            methods: {
+                                onResult: function (code, text, convBack) {
+                                    var ok = parseInt(String(code), 10) === 0;
+                                    console.log('[send_engine] action=notice code=' + code + ' text=' + text);
+                                    console.log('[send_engine] action=notice return=' + ok);
+                                }
+                            }
+                        });
+                    });
+                }
+                if (!engineNoticeCb) {
+                    console.log('[send_engine] action=notice error=callback unavailable');
+                    console.log('[send_engine] action=notice return=false');
+                    return;
+                }
+                svc.SetGroupNotification(conv, atNoticeRich([atNoticeTextPart(textBody)]), true, engineNoticeCb);
                 console.log('[send_engine] action=notice dispatched');
                 return;
             }
-            var SendCb = Java.registerClass({
-                name: 'com.testvoice.EngineAtCb' + Date.now(),
-                implements: [Java.use('com.tencent.wework.foundation.callback.ISendMessageCallback')],
-                methods: {
-                    onProgress: function () {},
-                    onResult: function (code, convBack, message) {
-                        var ok = parseInt(String(code), 10) === 0;
-                        console.log('[send_engine] action=at code=' + code);
-                        console.log('[send_engine] action=at return=' + ok);
-                    }
-                }
-            });
-            var sendCb = SendCb.$new();
-            AT_NOTICE_KEEP.push(sendCb);
+            if (!engineAtCb) {
+                engineAtCb = callbackSingleton('com.testvoice.EngineAtCb', function () {
+                    return Java.registerClass({
+                        name: 'com.testvoice.EngineAtCb',
+                        implements: [Java.use('com.tencent.wework.foundation.callback.ISendMessageCallback')],
+                        methods: {
+                            onProgress: function () {},
+                            onResult: function (code, convBack, message) {
+                                var ok = parseInt(String(code), 10) === 0;
+                                console.log('[send_engine] action=at code=' + code);
+                                console.log('[send_engine] action=at return=' + ok);
+                            }
+                        }
+                    });
+                });
+            }
+            if (!engineAtCb) {
+                console.log('[send_engine] action=at error=callback unavailable');
+                console.log('[send_engine] action=at return=false');
+                return;
+            }
+            var sendCb = engineAtCb;
             var Nano = Java.use('com.google.protobuf.nano.MessageNano');
             var WwMsg = Java.use('com.tencent.wework.foundation.model.pb.WwMessage$Message');
             var Message = Java.use('com.tencent.wework.foundation.model.Message');

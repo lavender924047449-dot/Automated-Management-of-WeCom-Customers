@@ -1,6 +1,6 @@
 [project]
 name = "wecom-voice-blaster"
-version = "0.1.1"
+version = "0.1.2"
 description = "企业微信客户消息工具（安卓模拟器 + Frida）"
 requires-python = ">=3.10"
 readme = "README.md"

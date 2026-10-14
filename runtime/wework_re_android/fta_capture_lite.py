@@ -534,147 +534,23 @@ Java.perform(function () {
         return s.indexOf('/storage/emulated/0/') === 0 || s.indexOf('/sdcard/') === 0;
     }
 
-    function findRecentImageCachePath(nowMs) {
-        if (!JFile) return '';
-        var roots = [
-            '/storage/emulated/0/Android/data/com.tencent.wework/files/tempimagecache',
-            '/sdcard/Android/data/com.tencent.wework/files/tempimagecache'
-        ];
-        var bestPath = '';
-        var bestScore = 1e18;
-        var seen = 0;
-
-        function visit(file, depth) {
-            if (!file || depth < 0 || seen > 1500) return;
-            seen++;
-            try {
-                if (!file.exists()) return;
-                var path = String(file.getAbsolutePath());
-                var lp = path.toLowerCase();
-                if (file.isDirectory()) {
-                    if (lp.indexOf('video_thumb') >= 0) return;
-                    var children = file.listFiles();
-                    if (!children) return;
-                    for (var i = 0; i < children.length; i++) visit(children[i], depth - 1);
-                    return;
-                }
-                if (lp.indexOf('video_thumb') >= 0) return;
-                var looksImage = lp.indexOf('_compress') >= 0 ||
-                    lp.indexOf('.png') >= 0 || lp.indexOf('.jpg') >= 0 ||
-                    lp.indexOf('.jpeg') >= 0 || lp.indexOf('.webp') >= 0 ||
-                    lp.indexOf('.gif') >= 0 || lp.indexOf('.bmp') >= 0;
-                if (!looksImage) return;
-                var mt = Number(file.lastModified());
-                if (!mt) return;
-                // 发送前后 90s 内最新/最近的图片缓存，覆盖选择图片后压缩文件稍晚落盘的情况。
-                var delta = Math.abs(nowMs - mt);
-                if (delta > 90000) return;
-                if (delta < bestScore) {
-                    bestScore = delta;
-                    bestPath = path;
-                }
-            } catch (_) {}
+    function overloadArgName(overload, index) {
+        try {
+            var types = overload.argumentTypes;
+            if (!types || index < 0 || index >= types.length) return '';
+            var t = types[index];
+            if (!t) return '';
+            return String(t.className || t.name || t);
+        } catch (eArg) {
+            return '';
         }
-
-        for (var r = 0; r < roots.length; r++) {
-            try { visit(JFile.$new(roots[r]), 5); } catch (_) {}
-        }
-        return bestPath;
     }
 
-    function findRecentVideoCachePath(nowMs) {
-        // GUI 发视频主链经常绕过 D8/U1/q8，SendMessage 时 Message 里也没有 url/filePath。
-        // 笔记 video_send_chain.md §9.2-B：本体落在 filecache/<vid>/.../<md5>.mp4。
-        if (!JFile) return '';
-        var roots = [
-            '/storage/emulated/0/Android/data/com.tencent.wework/files/filecache',
-            '/sdcard/Android/data/com.tencent.wework/files/filecache',
-            '/storage/emulated/0/Android/data/com.tencent.wework/files/tempvideocache',
-            '/sdcard/Android/data/com.tencent.wework/files/tempvideocache'
-        ];
-        var bestPath = '';
-        var bestScore = 1e18;
-        var seen = 0;
-
-        function visit(file, depth) {
-            if (!file || depth < 0 || seen > 2500) return;
-            seen++;
-            try {
-                if (!file.exists()) return;
-                var path = String(file.getAbsolutePath());
-                var lp = path.toLowerCase();
-                if (file.isDirectory()) {
-                    var children = file.listFiles();
-                    if (!children) return;
-                    for (var i = 0; i < children.length; i++) visit(children[i], depth - 1);
-                    return;
-                }
-                var looksVideo = lp.indexOf('.mp4') >= 0 || lp.indexOf('.mov') >= 0 ||
-                    lp.indexOf('.avi') >= 0 || lp.indexOf('.mkv') >= 0 || lp.indexOf('.m4v') >= 0;
-                var inFilecache = lp.indexOf('/filecache/') >= 0 || lp.indexOf('/tempvideocache/') >= 0;
-                if (!looksVideo && !inFilecache) return;
-                var mt = Number(file.lastModified());
-                if (!mt) return;
-                var delta = Math.abs(nowMs - mt);
-                if (delta > 90000) return;
-                // 一些版本 filecache 的视频临时文件没有标准扩展名；用大小过滤兜底。
-                if (!looksVideo && inFilecache) {
-                    var fs = Number(file.length());
-                    if (!fs || fs < 100 * 1024) return;
-                }
-                var score = delta + (looksVideo ? 0 : 4000);
-                if (score < bestScore) {
-                    bestScore = score;
-                    bestPath = path;
-                }
-            } catch (_) {}
-        }
-
-        for (var r = 0; r < roots.length; r++) {
-            try { visit(JFile.$new(roots[r]), 6); } catch (_) {}
-        }
-        return bestPath;
-    }
-
-    function findRecentVideoThumbPath(nowMs) {
-        if (!JFile) return '';
-        var roots = [
-            '/storage/emulated/0/Android/data/com.tencent.wework/files/tempimagecache',
-            '/sdcard/Android/data/com.tencent.wework/files/tempimagecache'
-        ];
-        var bestPath = '';
-        var bestScore = 1e18;
-        var seen = 0;
-
-        function visit(file, depth) {
-            if (!file || depth < 0 || seen > 1500) return;
-            seen++;
-            try {
-                if (!file.exists()) return;
-                var path = String(file.getAbsolutePath());
-                var lp = path.toLowerCase();
-                if (file.isDirectory()) {
-                    var children = file.listFiles();
-                    if (!children) return;
-                    for (var i = 0; i < children.length; i++) visit(children[i], depth - 1);
-                    return;
-                }
-                if (lp.indexOf('video_thumb') < 0) return;
-                var mt = Number(file.lastModified());
-                if (!mt) return;
-                var delta = Math.abs(nowMs - mt);
-                if (delta > 90000) return;
-                if (delta < bestScore) {
-                    bestScore = delta;
-                    bestPath = path;
-                }
-            } catch (_) {}
-        }
-
-        for (var r = 0; r < roots.length; r++) {
-            try { visit(JFile.$new(roots[r]), 6); } catch (_) {}
-        }
-        return bestPath;
+    // 看不出参数类型时仍挂上，避免漏掉主链；能看出不是 String 的重载不挂。
+    function overloadWorthHooking(overload, stringIndex) {
+        var name = overloadArgName(overload, stringIndex);
+        if (!name) return true;
+        return name.indexOf('String') >= 0;
     }
 
     // 从 FileMessage / VideoMessage / LinkMessage 反射拿本地路径
@@ -1057,35 +933,6 @@ Java.perform(function () {
         send({ event: 'error', stage: 'hook_u1', message: String(eU1) });
     }
 
-    // ------------------- image fallback: h8y.T1 -------------------
-    // T1(String,int,int,int) 也是历史 probe 中出现过的 FileMessage 构造器。
-    // 当前图片 mType=14 若绕过 V1，可在这里按路径后缀补 pending。
-    try {
-        var t1Method = h8y.T1;
-        var t1Overloads = t1Method.overloads;
-        for (var iT = 0; iT < t1Overloads.length; iT++) {
-            (function (o) {
-                o.implementation = function () {
-                    var t0 = Date.now();
-                    gc(t0);
-                    var argv = [];
-                    for (var k = 0; k < arguments.length; k++) argv.push(arguments[k]);
-                    var p = argv.length >= 1 ? String(argv[0] || '') : '';
-                    var cls = classifyMediaPath(p);
-                    if (p && isDevicePath(p) && cls === 'image') {
-                        pendingImages.push({ path: p, tsMs: t0 });
-                        send({ event: 'upstream_seen', kind: 'image', hook: 'h8y.T1', path: p, tsMs: t0 });
-                    }
-                    return o.apply(this, argv);
-                };
-            })(t1Overloads[iT]);
-        }
-        console.log('[fta_lite] hooked h8y.T1 (image fallback, ' + t1Overloads.length + ' overloads)');
-        send({ event: 'hooked', hook: 'h8y.T1', overloads: t1Overloads.length });
-    } catch (eT1) {
-        send({ event: 'error', stage: 'hook_t1', message: String(eT1) });
-    }
-
     // ------------------- image / video (fallback path): h8y.V1 -------------------
     // 真机实测（notes/image_send_chain.md §2/§4）：GUI 手动发图主链是
     //   h8y.V1(String path, int w, int h, int, boolean, Function2) -> FileMessage
@@ -1097,6 +944,7 @@ Java.perform(function () {
         var v1Method = h8y.V1;
         var v1Overloads = v1Method.overloads;
         for (var iV = 0; iV < v1Overloads.length; iV++) {
+            if (!overloadWorthHooking(v1Overloads[iV], 0)) continue;
             (function (o) {
                 o.implementation = function () {
                     var t0 = Date.now();
@@ -1124,47 +972,6 @@ Java.perform(function () {
         send({ event: 'error', stage: 'hook_v1', message: String(eV1) });
     }
 
-    // ------------------- image fallback: h8y.W1 -------------------
-    // 历史 image probe 证明发图链存在 V1 -> V8 -> W1(List, ...) -> SendMessage。
-    // 当前 mType=14 场景 V1/q8 未触发，但 MessageInfo 带 mediaProgressList；
-    // 补 hook W1，从 List 中的 FileMessage/Message 元素反射本地图片路径。
-    try {
-        var w1Method = h8y.W1;
-        var w1Overloads = w1Method.overloads;
-        for (var iW = 0; iW < w1Overloads.length; iW++) {
-            (function (o) {
-                o.implementation = function () {
-                    var t0 = Date.now();
-                    gc(t0);
-                    var argv = [];
-                    for (var k = 0; k < arguments.length; k++) argv.push(arguments[k]);
-                    var listObj = argv.length >= 1 ? argv[0] : null;
-                    try {
-                        if (listObj && typeof listObj.size === 'function' && typeof listObj.get === 'function') {
-                            var size = Math.min(10, listObj.size() | 0);
-                            for (var wi = 0; wi < size; wi++) {
-                                var item = null;
-                                try { item = listObj.get(wi); } catch (_) { item = null; }
-                                var extracted = extractFilePathFromMessage(item);
-                                var p = extracted.path;
-                                var cls = classifyMediaPath(p);
-                                if (p && isDevicePath(p) && cls === 'image') {
-                                    pendingImages.push({ path: p, tsMs: t0 });
-                                    send({ event: 'upstream_seen', kind: 'image', hook: 'h8y.W1', path: p, index: wi, tsMs: t0 });
-                                }
-                            }
-                        }
-                    } catch (_) {}
-                    return o.apply(this, argv);
-                };
-            })(w1Overloads[iW]);
-        }
-        console.log('[fta_lite] hooked h8y.W1 (image fallback, ' + w1Overloads.length + ' overloads)');
-        send({ event: 'hooked', hook: 'h8y.W1', overloads: w1Overloads.length });
-    } catch (eW1) {
-        send({ event: 'error', stage: 'hook_w1', message: String(eW1) });
-    }
-
     // ------------------- video (primary path): h8y.D8 -------------------
     // 真机实测（notes/video_send_chain.md §9.3）：视频主发送链是
     //   h8y.D8(Activity, long convId, String videoPath, String, String thumbPath, boolean)
@@ -1173,6 +980,7 @@ Java.perform(function () {
         var d8Method = h8y.D8;
         var d8Overloads = d8Method.overloads;
         for (var iD = 0; iD < d8Overloads.length; iD++) {
+            if (!overloadWorthHooking(d8Overloads[iD], 2)) continue;
             (function (o) {
                 o.implementation = function () {
                     var t0 = Date.now();
@@ -1202,6 +1010,7 @@ Java.perform(function () {
         var f2Method = h8y.f2;
         var f2Overloads = f2Method.overloads;
         for (var iF2 = 0; iF2 < f2Overloads.length; iF2++) {
+            if (!overloadWorthHooking(f2Overloads[iF2], 0)) continue;
             (function (o) {
                 o.implementation = function () {
                     var t0 = Date.now();
@@ -1240,72 +1049,29 @@ Java.perform(function () {
         for (var iQ = 0; iQ < q8Overloads.length; iQ++) {
             (function (o) {
                 o.implementation = function () {
-                    var t0 = Date.now();
-                    gc(t0);
-                    var argv = [];
-                    for (var k = 0; k < arguments.length; k++) argv.push(arguments[k]);
-                    // 定位 msgType（int）与 FileMessage：q8 常见形态是 (Ctx, long, FM, int, ...)
-                    var fm = null;
-                    var mt = -1;
-                    for (var j = 0; j < argv.length; j++) {
-                        var a = argv[j];
-                        if (a && typeof a === 'object' && a.getClass) {
-                            var cn = '';
-                            try { cn = String(a.getClass().getName()); } catch (_) {}
-                            if (cn.indexOf('FileMessage') >= 0 || cn.indexOf('Message') >= 0) fm = a;
-                        }
-                    }
-                    // msgType 通常是第 4 个参数（idx=3）；也可能是最后一个 int 前
-                    if (argv.length >= 4) {
-                        var maybeMt = argv[3];
-                        if (typeof maybeMt === 'number') mt = maybeMt | 0;
-                    }
-                    var extracted = extractFilePathFromMessage(fm);
-                    var p = extracted.path;
-                    var tp = extracted.thumbPath;
-                    send({ event: 'upstream_seen', kind: 'q8', hook: 'h8y.q8', msgType: mt, path: p, thumbPath: tp, argc: argv.length, tsMs: t0 });
-                    if (p) {
-                        // 按 msgType 优先分派；否则按路径后缀
-                        if ((mt === 7 || mt === 14) && isDevicePath(p)) {
-                            pendingImages.push({ path: p, tsMs: t0 });
-                        } else if (mt === 5 || mt === 23 || mt === 43 || mt === 62) {
-                            pendingVideos.push({ videoPath: p, thumbPath: tp, tsMs: t0, from: 'q8' });
-                        } else {
-                            var pc = classifyMediaPath(p);
-                            if (pc === 'image' && isDevicePath(p)) pendingImages.push({ path: p, tsMs: t0 });
-                            else if (pc === 'video') pendingVideos.push({ videoPath: p, thumbPath: tp, tsMs: t0, from: 'q8' });
-                        }
-                    }
-                    return o.apply(this, argv);
+                    var argv = arguments;
+                    var ret = o.apply(this, argv);
+                    try {
+                        if (argv.length < 4 || typeof argv[3] !== 'number') return ret;
+                        var mt = argv[3] | 0;
+                        var isImage = mt === 7 || mt === 14;
+                        var isVideo = mt === 5 || mt === 23 || mt === 43 || mt === 62;
+                        if (!isImage && !isVideo) return ret;
+                        var extracted = extractFilePathFromMessage(argv[2]);
+                        var p = extracted.path;
+                        var tp = extracted.thumbPath;
+                        if (!p) return ret;
+                        var t0 = Date.now();
+                        if (isImage) pendingImages.push({ path: p, tsMs: t0 });
+                        else pendingVideos.push({ videoPath: p, thumbPath: tp, tsMs: t0, from: 'q8' });
+                    } catch (eQ8Body) {}
+                    return ret;
                 };
             })(q8Overloads[iQ]);
         }
         console.log('[fta_lite] hooked h8y.q8 (generic dispatch, ' + q8Overloads.length + ' overloads)');
     } catch (eQ8) {
         send({ event: 'error', stage: 'hook_q8', message: String(eQ8) });
-    }
-
-    // ------------------- oa dispatch: h8y.s8 -------------------
-    // s8(Context, Conversation, Message, zi90, ISendMessageCallback) —— GUI 分享
-    // 公众号/小程序卡片走这里下发。仅诊断上报，因为 f2 已经把结构化字段入队了。
-    try {
-        var s8Method = h8y.s8;
-        var s8Overloads = s8Method.overloads;
-        for (var iS = 0; iS < s8Overloads.length; iS++) {
-            (function (o) {
-                o.implementation = function () {
-                    var t0 = Date.now();
-                    gc(t0);
-                    var argv = [];
-                    for (var k = 0; k < arguments.length; k++) argv.push(arguments[k]);
-                    send({ event: 'upstream_seen', kind: 'oa_dispatch', hook: 'h8y.s8', argc: argv.length, tsMs: t0 });
-                    return o.apply(this, argv);
-                };
-            })(s8Overloads[iS]);
-        }
-        console.log('[fta_lite] hooked h8y.s8 (oa/wxa dispatch, ' + s8Overloads.length + ' overloads)');
-    } catch (eS8) {
-        send({ event: 'error', stage: 'hook_s8', message: String(eS8) });
     }
 
     // ------------------- SendMessage: mType 分派 -------------------
@@ -1317,11 +1083,13 @@ Java.perform(function () {
             'com.tencent.wework.foundation.callback.ISendMessageCallback'
         );
         sm0.implementation = function (conv, msg, cb) {
+            var ids = parseConvIds(String(conv || ''));
+            if (ids.remote !== FTA_REMOTE_ID) {
+                return sm0.call(this, conv, msg, cb);
+            }
             var t0 = Date.now();
             gc(t0);
-            var convStr = String(conv || '');
             var msgStr = String(msg || '');
-            var ids = parseConvIds(convStr);
             var mType = parseMsgType(msgStr);
             var lId = parseLId(msgStr);
             // Java Message identityHashCode 兜底（lId 未回填时也能去重）
@@ -1375,24 +1143,12 @@ Java.perform(function () {
                     if (img) {
                         send({ event: 'fta_image_seen', convLocal: ids.local, convRemote: ids.remote, sourcePath: img.path, mType: mType, source: 'pending', tsMs: t0, hookElapsedMs: Date.now() - t0 });
                     } else {
-                        var dumpImg = dumpMessageFields(msg, 3000);
+                        var dumpImg = dumpMessageFields(msg, 1200);
                         var reflectedImg = extractImageFromDump(dumpImg);
                         if (reflectedImg.imagePath) {
                             send({ event: 'fta_image_seen', convLocal: ids.local, convRemote: ids.remote, sourcePath: reflectedImg.imagePath, mType: mType, source: 'reflect', tsMs: t0, hookElapsedMs: Date.now() - t0 });
                         } else {
-                            var cacheImgPath = findRecentImageCachePath(t0);
-                            if (cacheImgPath) {
-                                send({ event: 'fta_image_seen', convLocal: ids.local, convRemote: ids.remote, sourcePath: cacheImgPath, mType: mType, source: 'tempimagecache', tsMs: t0, hookElapsedMs: Date.now() - t0 });
-                            } else {
-                                var imgFieldNames = Object.keys(dumpImg.fields);
-                                var imgSubNames = {};
-                                Object.keys(dumpImg.sub).forEach(function (k) {
-                                    imgSubNames[k] = Object.keys(dumpImg.sub[k]);
-                                });
-                                // 诊断：把解码后的字段"值"也带上（已在 dumpMessageFields 里截断到 3000）。
-                                // 用来看清 mType=14 图片消息把本地路径/md5/CDN 引用藏在哪个字段。
-                                send({ event: 'dispatch_miss', kind: 'image', mType: mType, pendingSize: pendingImages.length, tsMs: t0, msgFields: imgFieldNames, msgSub: imgSubNames, msgDump: dumpImg });
-                            }
+                            send({ event: 'dispatch_miss', kind: 'image', mType: mType, pendingSize: pendingImages.length, tsMs: t0 });
                         }
                     }
                 }
@@ -1407,28 +1163,14 @@ Java.perform(function () {
                     if (!vpath) {
                         // 反射兜底 —— 参考 notes/video_send_chain.md §9.1-A：
                         // VideoMessage 字段 url/rawUrl = videoPath；previewImgUrl = thumbPath
-                        var dump = dumpMessageFields(msg, 8000);
+                        var dump = dumpMessageFields(msg, 1200);
                         var reflectedVideo = extractVideoFromDump(dump);
                         vpath = reflectedVideo.videoPath;
                         tpath = reflectedVideo.thumbPath;
                         vSource = vpath ? 'reflect' : '';
                     }
                     if (!vpath) {
-                        var cacheVidPath = findRecentVideoCachePath(t0);
-                        if (cacheVidPath) {
-                            vpath = cacheVidPath;
-                            vSource = 'filecache';
-                            if (!tpath) tpath = findRecentVideoThumbPath(t0);
-                        }
-                    }
-                    if (!vpath) {
-                        var missDump = dumpMessageFields(msg, 8000);
-                        var fieldNames = Object.keys(missDump.fields);
-                        var subNames = {};
-                        Object.keys(missDump.sub).forEach(function (k) {
-                            subNames[k] = Object.keys(missDump.sub[k]);
-                        });
-                        send({ event: 'dispatch_miss', kind: 'video', mType: mType, pendingSize: pendingVideos.length, tsMs: t0, msgFields: fieldNames, msgSub: subNames, msgDump: missDump });
+                        send({ event: 'dispatch_miss', kind: 'video', mType: mType, pendingSize: pendingVideos.length, tsMs: t0 });
                     }
                     if (vpath) {
                         send({ event: 'fta_video_seen', convLocal: ids.local, convRemote: ids.remote, videoPath: vpath, thumbPath: tpath, source: vSource, tsMs: t0, hookElapsedMs: Date.now() - t0 });
@@ -1504,7 +1246,7 @@ Java.perform(function () {
                     if (!link && !title) {
                         // 反射兜底 —— 参考 notes/oa_send_chain.md §7.3：
                         // LinkMessage 字段 url/title/desc/previewImgUrl
-                        var dumpOa = dumpMessageFields(msg, 3000);
+                        var dumpOa = dumpMessageFields(msg, 1200);
                         var reflectedOa = extractOaFromDump(dumpOa);
                         link = reflectedOa.link;
                         title = reflectedOa.title;
@@ -1525,24 +1267,6 @@ Java.perform(function () {
                     }
                     }
                 }
-                else {
-                    // 兜底：未知 mType 也尝试提取视频路径，兼容客户端/上传入口差异。
-                    var anyDump = dumpMessageFields(msg, 8000);
-                    var anyVideo = extractVideoFromDump(anyDump);
-                    if (anyVideo.videoPath) {
-                        send({
-                            event: 'fta_video_seen',
-                            convLocal: ids.local,
-                            convRemote: ids.remote,
-                            videoPath: anyVideo.videoPath,
-                            thumbPath: anyVideo.thumbPath || '',
-                            source: 'reflect:unknown_mtype',
-                            mType: mType,
-                            tsMs: t0,
-                            hookElapsedMs: Date.now() - t0
-                        });
-                    }
-                }
             }
             return sm0.call(this, conv, msg, cb);
         };
@@ -1553,18 +1277,19 @@ Java.perform(function () {
                 'com.tencent.wework.foundation.callback.ISendMessageCallback'
             );
             sm1.implementation = function (convRef, msg, cb) {
+                var ids = parseConvIds(String(convRef || ''));
+                if (ids.remote !== FTA_REMOTE_ID && pendingImages.length === 0) {
+                    return sm1.call(this, convRef, msg, cb);
+                }
                 var t0 = Date.now();
                 gc(t0);
-                var convStr = String(convRef || '');
                 var msgStr = String(msg || '');
-                var ids = parseConvIds(convStr);
                 var mType = parseMsgType(msgStr);
                 var lId = parseLId(msgStr);
                 var dumpForIds = null;
-                if (!ids.local || !ids.remote) {
-                    dumpForIds = dumpMessageFields(msg, 3000);
+                if (ids.remote === FTA_REMOTE_ID && !ids.local) {
+                    dumpForIds = dumpMessageFields(msg, 800);
                     if (!ids.local) ids.local = pickFromDump(dumpForIds, ['conversationId']);
-                    if (!ids.remote) ids.remote = pickFromDump(dumpForIds, ['remoteId']);
                 }
                 var msgHc = '';
                 try {
@@ -1600,22 +1325,12 @@ Java.perform(function () {
                         if (img) {
                             send({ event: 'fta_image_seen', convLocal: ids.local, convRemote: ids.remote || FTA_REMOTE_ID, sourcePath: img.path, mType: mType, source: 'pending:ConversationRef', tsMs: t0, hookElapsedMs: Date.now() - t0 });
                         } else {
-                            var dumpImg = dumpForIds || dumpMessageFields(msg, 3000);
+                            var dumpImg = dumpForIds || dumpMessageFields(msg, 1200);
                             var reflectedImg = extractImageFromDump(dumpImg);
                             if (reflectedImg.imagePath) {
                                 send({ event: 'fta_image_seen', convLocal: ids.local, convRemote: ids.remote || FTA_REMOTE_ID, sourcePath: reflectedImg.imagePath, mType: mType, source: 'reflect:ConversationRef', tsMs: t0, hookElapsedMs: Date.now() - t0 });
                             } else {
-                                var cacheImgPath = findRecentImageCachePath(t0);
-                                if (cacheImgPath) {
-                                    send({ event: 'fta_image_seen', convLocal: ids.local, convRemote: ids.remote || FTA_REMOTE_ID, sourcePath: cacheImgPath, mType: mType, source: 'tempimagecache:ConversationRef', tsMs: t0, hookElapsedMs: Date.now() - t0 });
-                                } else {
-                                    var imgFieldNames = Object.keys(dumpImg.fields);
-                                    var imgSubNames = {};
-                                    Object.keys(dumpImg.sub).forEach(function (k) {
-                                        imgSubNames[k] = Object.keys(dumpImg.sub[k]);
-                                    });
-                                    send({ event: 'dispatch_miss', kind: 'image', source: 'ConversationRef', mType: mType, pendingSize: pendingImages.length, tsMs: t0, msgFields: imgFieldNames, msgSub: imgSubNames, msgDump: dumpImg });
-                                }
+                                send({ event: 'dispatch_miss', kind: 'image', source: 'ConversationRef', mType: mType, pendingSize: pendingImages.length, tsMs: t0 });
                             }
                         }
                     }

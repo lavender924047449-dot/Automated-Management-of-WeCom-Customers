@@ -9,5 +9,10 @@ def test_mini_program_mtype_is_not_classified_as_oa() -> None:
     assert "event: 'fta_wxa_seen'" in JS
     assert "event: 'fta_text_seen'" in JS
     assert "mType === 0 || mType === 1 || mType === 2" in JS
+    assert "hooked h8y.T1" not in JS
+    assert "hooked h8y.W1" not in JS
+    assert "hooked h8y.s8" not in JS
+    assert "findRecentImageCachePath" not in JS
+    assert "ids.remote !== FTA_REMOTE_ID" in JS
     assert "if (ct !== 13 && ct !== 78) return null;" not in JS
     assert "if (ct !== 13) return null;" in JS
