@@ -27,7 +27,7 @@ from runtime.wework_re_android._frida_env import adb_binary
 DEFAULT_ADB_SERIAL = "127.0.0.1:16384"
 DEFAULT_FRIDA_REMOTE = "127.0.0.1:27042"
 DEFAULT_PROCESS_NAME = "com.tencent.wework"
-DEFAULT_TIMEOUT_SECONDS = 180.0
+DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_FS_POLL_SECONDS = 0.8
 DEFAULT_ROOT = "/storage/emulated/0/Android/data/com.tencent.wework/files"
 DEFAULT_OUT_NDJSON = "runtime/wework_re_android/artifacts/wxa_pipeline.ndjson"
@@ -115,6 +115,119 @@ Java.perform(function () {
         out.fields = dumpFlatObject(fm);
         return out;
     }
+
+    function fieldObject(obj, fieldName) {
+        if (!obj) return null;
+        try {
+            var f = obj.getClass().getDeclaredField(fieldName);
+            f.setAccessible(true);
+            return f.get(obj);
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function bytesField(obj, fieldName) {
+        var v = fieldObject(obj, fieldName);
+        if (!v) return '';
+        try {
+            if (String(v.getClass().getName()) !== '[B') return '';
+            return bytesToBase64(v);
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function protoBytes(obj) {
+        var out = { b64: '', len: 0, cls: '', via: '', err: '' };
+        if (!obj) return out;
+        try { out.cls = String(obj.getClass().getName()); } catch (eCls) { out.err = 'cls:' + eCls; }
+        function take(raw, via) {
+            if (!raw) return false;
+            var n = 0;
+            try { n = raw.length | 0; } catch (_) { n = 0; }
+            if (n <= 0) return false;
+            out.b64 = bytesToBase64(raw);
+            out.len = n;
+            out.via = via;
+            return true;
+        }
+        try {
+            if (typeof obj.toByteArray === 'function' && take(obj.toByteArray(), 'direct')) return out;
+        } catch (eDirect) {
+            out.err = 'direct:' + eDirect;
+        }
+        if (out.cls) {
+            try {
+                var Cls = Java.use(out.cls);
+                var casted = Java.cast(obj, Cls);
+                if (take(casted.toByteArray(), 'cast')) return out;
+                out.err = (out.err ? out.err + '; ' : '') + 'cast:empty';
+            } catch (eCast) {
+                out.err = (out.err ? out.err + '; ' : '') + 'cast:' + eCast;
+            }
+        }
+        try {
+            var MN = Java.use('com.google.protobuf.nano.MessageNano');
+            var rawNano = MN.toByteArray.overload('com.google.protobuf.nano.MessageNano').call(MN, obj);
+            if (take(rawNano, 'messageNano')) return out;
+            out.err = (out.err ? out.err + '; ' : '') + 'nano:empty';
+        } catch (eNano) {
+            out.err = (out.err ? out.err + '; ' : '') + 'nano:' + eNano;
+        }
+        return out;
+    }
+
+    function cardBytes(msg) {
+        var infoObj = null;
+        try { infoObj = msg ? msg.getInfo() : null; } catch (_) {}
+        var extra = protoBytes(fieldObject(infoObj, 'extraContent'));
+        var extras = protoBytes(fieldObject(infoObj, 'extras'));
+        var info = protoBytes(infoObj);
+        var content = fieldObject(infoObj, 'content');
+        var contentLen = 0;
+        try { if (content) contentLen = content.length | 0; } catch (_) {}
+        return {
+            contentB64: bytesField(infoObj, 'content'),
+            contentLen: contentLen,
+            extraContentB64: extra.b64,
+            extraContentLen: extra.len,
+            extraContentClass: extra.cls,
+            extraContentVia: extra.via,
+            extraContentErr: extra.err,
+            extrasB64: extras.b64,
+            extrasLen: extras.len,
+            extrasClass: extras.cls,
+            extrasErr: extras.err,
+            infoB64: info.b64,
+            infoLen: info.len,
+            infoClass: info.cls,
+            infoVia: info.via,
+            infoErr: info.err,
+            miniProgramGetters: dumpGetterObject(msg, MINI_GETTERS),
+            infoMiniProgramGetters: dumpGetterObject(infoObj, MINI_GETTERS)
+        };
+    }
+
+    function dumpGetterObject(obj, names) {
+        var out = {};
+        if (!obj) return out;
+        for (var i = 0; i < names.length; i++) {
+            var name = names[i];
+            try {
+                if (typeof obj[name] !== 'function') continue;
+                var v = obj[name].call(obj);
+                if (!v) continue;
+                out[name] = {
+                    cls: String(v.getClass().getName()),
+                    fields: dumpFlatObject(v)
+                };
+            } catch (_) {}
+        }
+        return out;
+    }
+
+    var MINI_GETTERS = ['getMiniProgramMessage', 'getWeAppMessage', 'getWxaMessage', 'getLinkMessage'];
 
     function dumpMessageInfo(msg) {
         var out = {};
@@ -218,14 +331,26 @@ Java.perform(function () {
         sm0.implementation = function (conv, msg, cb) {
             var convStr = String(conv || '');
             var msgStr = String(msg || '');
-            emit('send_message', {
+            var before = cardBytes(msg);
+            var enterRow = {
+                phase: 'enter',
                 mType: parseMType(msgStr),
                 conv: parseConv(convStr),
                 convRaw: convStr,
-                msgRaw: msgStr,
-                messageInfoSnapshot: dumpMessageInfo(msg),
-            });
-            return sm0.call(this, conv, msg, cb);
+                msgRaw: msgStr
+            };
+            Object.keys(before).forEach(function (k) { enterRow[k] = before[k]; });
+            emit('send_message', enterRow);
+            var ret = sm0.call(this, conv, msg, cb);
+            var after = cardBytes(msg);
+            var leaveRow = {
+                phase: 'leave',
+                mType: parseMType(String(msg || '')),
+                conv: parseConv(convStr)
+            };
+            Object.keys(after).forEach(function (k) { leaveRow[k] = after[k]; });
+            emit('send_message_after', leaveRow);
+            return ret;
         };
         emit('hooked', { cls: 'ConversationService', method: 'SendMessage(Conversation,Message,Callback)' });
     } catch (e0) {
@@ -242,13 +367,30 @@ Java.perform(function () {
         sm1.implementation = function (convRef, msg, cb) {
             var refStr = String(convRef || '');
             var msgStr = String(msg || '');
+            var before = cardBytes(msg);
             emit('send_message_ref', {
+                phase: 'enter',
                 mType: parseMType(msgStr),
                 convRefRaw: refStr,
                 msgRaw: msgStr,
-                messageInfoSnapshot: dumpMessageInfo(msg),
+                contentB64: before.contentB64,
+                extraContentB64: before.extraContentB64,
+                extrasB64: before.extrasB64,
+                infoB64: before.infoB64,
+                miniProgramGetters: before.miniProgramGetters,
+                infoMiniProgramGetters: before.infoMiniProgramGetters
             });
-            return sm1.call(this, convRef, msg, cb);
+            var ret = sm1.call(this, convRef, msg, cb);
+            var after = cardBytes(msg);
+            emit('send_message_ref_after', {
+                phase: 'leave',
+                mType: parseMType(String(msg || '')),
+                contentB64: after.contentB64,
+                extraContentB64: after.extraContentB64,
+                extrasB64: after.extrasB64,
+                infoB64: after.infoB64
+            });
+            return ret;
         };
         emit('hooked', { cls: 'ConversationService', method: 'SendMessage(ConversationRef,Message,Callback)' });
     } catch (e1) {
@@ -425,7 +567,7 @@ def main() -> int:
             "ftaRemoteId": args.fta_remote_id,
         }
     )
-    print("[probe_wxa] now manually share ONE mini-program card to FTA")
+    print("[probe_wxa] 60 秒内请把一个小程序分享到文件传输助手，只分享一次")
 
     prev = poll_thumb_fs(args.adb_serial, args.wework_files_root)
     deadline = time.time() + args.timeout_seconds

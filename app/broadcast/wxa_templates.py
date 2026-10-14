@@ -75,6 +75,17 @@ def save_template(
     return out
 
 
+def has_card_fields(payload: dict[str, Any]) -> bool:
+    """模板里是否有足够字段组成一条 contentType 78 消息。"""
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("weappBodyB64") or "").strip():
+        return True
+    username = str(payload.get("username") or "").strip()
+    pagepath = str(payload.get("pagepath") or "").strip()
+    return bool(username and pagepath)
+
+
 def load_template(
     template_ref: str,
     *,

@@ -5,7 +5,7 @@ from subprocess import CompletedProcess
 import pytest
 
 from app.broadcast.labels import LocalLabelStore
-from runtime.wework_re_android.conv_resolver import ConversationResolver, parse_hits
+from runtime.wework_re_android.conv_resolver import ConversationResolver, parse_hits, parse_rows, parse_label_map
 
 
 def _ok(stdout: str) -> CompletedProcess[str]:
@@ -133,3 +133,80 @@ def test_resolve_by_label_raises_when_alpha_and_beta_empty(tmp_path):
     )
     with pytest.raises(LookupError, match="未找到标签"):
         resolver.resolve_by_label("新客")
+
+
+# ==================== Step 2: 多标签解析测试 ====================
+
+
+def test_parse_rows_preserves_multiple_label_names():
+    """两个 labelNames 都应进入 ConversationHit.labels。"""
+    import json
+
+    row = json.dumps({
+        "t": "row", "tag": "now", "i": 0,
+        "local": "1001", "remote": "2001", "type": 0,
+        "peerName": "客户A", "ourRemark": "备注A",
+        "userName": "", "corpName": "", "groupCandidates": {},
+        "labelIds": ["111", "222"],
+        "labelNames": ["VIP客户", "重点跟进"],
+        "raw": "",
+    })
+    hits = parse_rows(row)
+    assert len(hits) == 1
+    assert "VIP客户" in hits[0].labels
+    assert "重点跟进" in hits[0].labels
+    assert len(hits[0].labels) == 2
+
+
+def test_parse_rows_drops_numeric_only_label_ids():
+    """纯数字 label id 在没有名字时不展示成标签文案。"""
+    import json
+
+    row = json.dumps({
+        "t": "row", "tag": "now", "i": 0,
+        "local": "1001", "remote": "2001", "type": 0,
+        "peerName": "客户B", "ourRemark": "",
+        "userName": "", "corpName": "", "groupCandidates": {},
+        "labelIds": ["999"],
+        "labelNames": [],
+        "raw": "",
+    })
+    hits = parse_rows(row)
+    assert len(hits) == 1
+    assert hits[0].labels == ()
+    assert hits[0].has_external_label is True
+    assert hits[0].corp_name == ""
+
+
+def test_parse_rows_uses_account_label_map_fallback():
+    """当 labelNames 为空时，account_label_map 提供的名字应被使用。"""
+    import json
+
+    row = json.dumps({
+        "t": "row", "tag": "now", "i": 0,
+        "local": "1001", "remote": "2001", "type": 0,
+        "peerName": "客户C", "ourRemark": "",
+        "userName": "", "corpName": "", "groupCandidates": {},
+        "labelIds": ["333"],
+        "labelNames": [],
+        "raw": "",
+    })
+    acct_map = {"333": "大客户"}
+    hits = parse_rows(row, account_label_map=acct_map)
+    assert len(hits) == 1
+    assert "大客户" in hits[0].labels
+
+
+def test_parse_label_map_extracts_from_output():
+    """parse_label_map 应正确提取 t:'label_map' 事件。"""
+    import json
+
+    line = json.dumps({"t": "label_map", "map": {"111": "VIP", "222": "新客"}})
+    result = parse_label_map(line)
+    assert result == {"111": "VIP", "222": "新客"}
+
+
+def test_parse_label_map_returns_empty_on_no_event():
+    """没有 label_map 事件时返回空字典。"""
+    result = parse_label_map("[now] total=5\n")
+    assert result == {}

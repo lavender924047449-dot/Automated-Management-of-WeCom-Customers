@@ -11,9 +11,12 @@ QProcess wxa 采集、CaptureClient 的 Popen 等）。Windows 默认没有「�
 -----
 启动时创建一个 Job Object，把当前进程 assign 进去，并设置
 ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``：一旦 job handle 关闭（主进程死了），
-kernel 立即 kill 所有在 job 里的进程。因为子进程默认继承 job（除非它们显式
-调 CreateProcess with CREATE_BREAKAWAY_FROM_JOB），所有 subprocess.run /
-QProcess spawn 出来的进程都会被囊括。
+kernel 立即 kill 所有在 job 里的进程。因为子进程默认继承 job，所有
+subprocess.run / QProcess spawn 出来的进程都会被囊括。
+
+同时设置 ``JOB_OBJECT_LIMIT_BREAKAWAY_OK``。普通子进程仍然死在父进程后面；
+目录分发的更新器会带 ``CREATE_BREAKAWAY_FROM_JOB`` 脱离这个 job，这样主程序
+退出后它还能覆盖「程序」并重新打开。
 
 非 Windows / frozen=False / 已在别的 job 里 —— 全部静默跳过，不影响 dev。
 """
@@ -37,6 +40,7 @@ _JOB_HANDLE: int | None = None  # 保活：句柄不能被 gc
 # ---- WinAPI 常量 ----
 _JobObjectExtendedLimitInformation = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 
 
 class _IO_COUNTERS(ctypes.Structure):
@@ -100,7 +104,9 @@ def bind_kill_on_close() -> bool:
 
         # 配置 KILL_ON_JOB_CLOSE
         info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        info.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        )
 
         set_info = kernel32.SetInformationJobObject
         set_info.restype = wintypes.BOOL

@@ -93,12 +93,13 @@ class PreviewService:
         local_silk = self._materialize_local(raw, fallback_ext=".silk")
         if not local_silk:
             return ""
-        if local_silk.suffix.lower() == ".wav":
+        if local_silk.suffix.lower() in {".wav", ".mp3", ".m4a", ".aac", ".ogg"}:
             self.gc_cache()
             return str(local_silk)
         wav = self._decode_silk_to_wav(local_silk)
         self.gc_cache()
-        return str(wav) if wav is not None else str(local_silk)
+        # QMediaPlayer 不能可靠播放 silk；解码失败时不要把 silk 当音频源。
+        return str(wav) if wav is not None and wav.exists() else ""
 
     def _preview_media(self, payload: Mapping[str, Any], *, asset_type: str) -> str:
         source = str(payload.get("path") or payload.get("file_path") or payload.get("file") or "").strip()
@@ -112,7 +113,11 @@ class PreviewService:
     def _resolve_voice_source(self, payload: Mapping[str, Any]) -> str:
         path_value = str(payload.get("path", "")).strip()
         if path_value:
-            return path_value
+            if is_android_path(path_value) or Path(path_value).is_file():
+                return path_value
+            # 素材库历史索引可能只保存相对于 voice_lib 的文件名。
+            if not Path(path_value).is_absolute():
+                return f"{VOICE_LIB_ROOT.rstrip('/')}/{path_value.lstrip('/')}"
         file_value = str(payload.get("file", "")).strip()
         if not file_value:
             return ""

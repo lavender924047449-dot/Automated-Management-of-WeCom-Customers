@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 from app.config import resolve_path
 
 DEFAULT_ADAPTER_BASE_URL = (
-    "https://github.com/DivergerThinking/Test-Voice/raw/main/dist/adapter/5.0.10.6015"
+    "https://github.com/lavender924047449-dot/Automated-Management-of-WeCom-Customers/raw/main/dist/adapter/5.0.10.6015"
 )
 DEFAULT_LOCAL_ADAPTER_DIR = Path("runtime") / "wework_re_android"
 DEFAULT_LOCAL_MANIFEST = DEFAULT_LOCAL_ADAPTER_DIR / "adapter_manifest.json"

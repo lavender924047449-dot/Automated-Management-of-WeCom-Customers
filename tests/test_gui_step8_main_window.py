@@ -67,7 +67,7 @@ def test_check_update_latest_shows_info_when_manual(window: MainWindow, monkeypa
             current_version="0.1.0",
             latest_version="0.1.0",
             has_update=False,
-            releases_url="https://github.com/DivergerThinking/Test-Voice/releases",
+            releases_url="https://github.com/lavender924047449-dot/Automated-Management-of-WeCom-Customers/releases",
             error="",
         ),
     )
@@ -78,6 +78,80 @@ def test_check_update_latest_shows_info_when_manual(window: MainWindow, monkeypa
     )
     window._check_update_prompt(silent=False)
     assert called["n"] == 1
+
+
+def _fake_message_box(monkeypatch, buttons: list[str]):
+    class _FakeMessageBox:
+        Icon = QMessageBox.Icon
+        ButtonRole = QMessageBox.ButtonRole
+        StandardButton = QMessageBox.StandardButton
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            self._clicked = None
+
+        def setIcon(self, _icon) -> None:
+            return None
+
+        def setWindowTitle(self, _title: str) -> None:
+            return None
+
+        def setText(self, _text: str) -> None:
+            return None
+
+        def addButton(self, text, *_args, **_kwargs):
+            buttons.append(str(text))
+            return text
+
+        def exec(self) -> int:
+            return 0
+
+        def clickedButton(self):
+            return None
+
+    monkeypatch.setattr("gui.main_window.QMessageBox", _FakeMessageBox)
+
+
+def test_check_update_offers_apply_for_portable_install(window: MainWindow, monkeypatch, tmp_path: Path):
+    home = tmp_path / "install"
+    (home / "程序").mkdir(parents=True)
+    (home / "python").mkdir()
+    (home / "python" / "pythonw.exe").write_bytes(b"py")
+    monkeypatch.setenv("TESTVOICE_HOME", str(home))
+    monkeypatch.setattr(
+        "gui.main_window.check_latest_version",
+        lambda: VersionCheckResult(
+            current_version="0.1.0",
+            latest_version="0.2.0",
+            has_update=True,
+            releases_url="https://github.com/org/Test-Voice/releases/tag/v0.2.0",
+            asset_name="program-update.zip",
+            asset_url="https://github.com/org/Test-Voice/releases/download/v0.2.0/program-update.zip",
+        ),
+    )
+    buttons: list[str] = []
+    _fake_message_box(monkeypatch, buttons)
+    window._check_update_prompt(silent=False)
+    assert "更新并重启" in buttons
+    assert "打开发布页" not in buttons
+
+
+def test_check_update_dev_install_opens_release_page(window: MainWindow, monkeypatch):
+    monkeypatch.delenv("TESTVOICE_HOME", raising=False)
+    monkeypatch.setattr(
+        "gui.main_window.check_latest_version",
+        lambda: VersionCheckResult(
+            current_version="0.1.0",
+            latest_version="0.2.0",
+            has_update=True,
+            releases_url="https://github.com/org/Test-Voice/releases/tag/v0.2.0",
+            asset_url="https://github.com/org/Test-Voice/releases/download/v0.2.0/program-update.zip",
+        ),
+    )
+    buttons: list[str] = []
+    _fake_message_box(monkeypatch, buttons)
+    window._check_update_prompt(silent=False)
+    assert "打开发布页" in buttons
+    assert "更新并重启" not in buttons
 
 
 def test_about_dialog_contains_versions(window: MainWindow, monkeypatch):
@@ -114,4 +188,4 @@ def test_about_dialog_contains_versions(window: MainWindow, monkeypatch):
     window._show_about_dialog()
     assert "版本号：0.1.0" in captured["text"]
     assert "企微适配版本：" in captured["text"]
-    assert "GitHub：" in captured["text"]
+    assert "项目地址：" in captured["text"]

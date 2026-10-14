@@ -1,4 +1,8 @@
-"""Step 18.1: GitHub Releases 版本检查。"""
+"""GitHub Releases 版本检查。
+
+发布附件名必须是 ``program-update.zip``。压缩包根目录只放「程序」和
+``pyproject.toml``，由目录分发安装覆盖代码，不碰 data 和 vendor。
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from importlib import metadata
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -13,10 +18,11 @@ from urllib.request import Request, urlopen
 
 from app.config import project_root
 
-DEFAULT_GITHUB_REPO = "DivergerThinking/Test-Voice"
+DEFAULT_GITHUB_REPO = "lavender924047449-dot/Automated-Management-of-WeCom-Customers"
 DEFAULT_RELEASES_PAGE = f"https://github.com/{DEFAULT_GITHUB_REPO}/releases"
 DEFAULT_RELEASES_API = f"https://api.github.com/repos/{DEFAULT_GITHUB_REPO}/releases/latest"
 DEFAULT_ADAPTER_VERSION = "5.0.10.6015"
+PROGRAM_UPDATE_ASSET = "program-update.zip"
 
 
 @dataclass(slots=True)
@@ -26,6 +32,8 @@ class VersionCheckResult:
     has_update: bool
     releases_url: str
     error: str = ""
+    asset_name: str = ""
+    asset_url: str = ""
 
 
 def get_local_app_version() -> str:
@@ -81,13 +89,34 @@ def check_latest_version(
     release_link = str(payload.get("html_url", "")).strip() if isinstance(payload, dict) else ""
     if release_link:
         releases_url = release_link
+    asset_name, asset_url = _extract_update_asset(payload)
     return VersionCheckResult(
         current_version=current,
         latest_version=latest,
         has_update=_is_newer(latest, current),
         releases_url=releases_url or DEFAULT_RELEASES_PAGE,
         error="",
+        asset_name=asset_name,
+        asset_url=asset_url,
     )
+
+
+def _extract_update_asset(payload: Any) -> tuple[str, str]:
+    if not isinstance(payload, dict):
+        return "", ""
+    assets = payload.get("assets")
+    if not isinstance(assets, list):
+        return "", ""
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name", "")).strip()
+        if name.lower() != PROGRAM_UPDATE_ASSET.lower():
+            continue
+        url = str(asset.get("browser_download_url", "")).strip()
+        if url:
+            return name, url
+    return "", ""
 
 
 def _extract_latest_version(payload: Any) -> str:
@@ -133,13 +162,16 @@ def _version_key(raw: str) -> tuple[int, ...]:
     return tuple(out) or (0,)
 
 
-def _read_version_from_pyproject() -> str:
-    target = project_root() / "pyproject.toml"
-    if not target.exists():
+def read_pyproject_version(path: Path) -> str:
+    if not path.is_file():
         return ""
-    body = target.read_text(encoding="utf-8", errors="ignore")
-    m = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"\s*$', body)
-    return str(m.group(1)).strip() if m else ""
+    body = path.read_text(encoding="utf-8", errors="ignore")
+    match = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"\s*$', body)
+    return str(match.group(1)).strip() if match else ""
+
+
+def _read_version_from_pyproject() -> str:
+    return read_pyproject_version(project_root() / "pyproject.toml")
 
 
 def _format_check_error(exc: Exception) -> str:

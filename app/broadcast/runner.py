@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal, Protocol
 
@@ -19,11 +20,15 @@ from app.broadcast.image_templates import load_template as load_image_template
 from app.broadcast.library import TextTemplate, VoiceLibrary, VoiceLibraryEntry
 from app.broadcast.oa_templates import load_template as load_oa_template
 from app.broadcast.paths import VOICE_LIB_ROOT
-from app.broadcast.perturb import PerturbResult, create_perturbed_copy
+from app.broadcast.wxa_templates import has_card_fields, load_template as load_wxa_template
 from app.broadcast.plan import (
+    AtStep,
     BundleStep,
     BroadcastPlan,
+    ChannelStep,
+    DocStep,
     ImageStep,
+    NoticeStep,
     OaStep,
     SequenceStep,
     TextStep,
@@ -33,6 +38,7 @@ from app.broadcast.plan import (
     step_status,
 )
 from app.broadcast.report_store import ReportStore
+from app.broadcast.send_units import SendUnit, expand_send_units, select_units
 from app.broadcast.video_templates import load_template as load_video_template
 
 RunnerStatus = Literal[
@@ -40,6 +46,8 @@ RunnerStatus = Literal[
     "failed",
     "blocked",
     "resolve_failed",
+    "paused",
+    "before_send",
 ]
 
 
@@ -52,10 +60,19 @@ class SendClient(Protocol):
     def send_text(self, *, conv_local: str, body: str) -> bool:
         ...
 
+    def send_at(self, *, conv_local: str, body: str) -> bool:
+        ...
+
+    def send_notice(self, *, conv_local: str, body: str) -> bool:
+        ...
+
     def send_image(self, *, conv_local: str, image_path: str) -> bool:
         ...
 
     def send_oa(self, *, conv_local: str, template: str) -> bool:
+        ...
+
+    def send_wxa(self, *, conv_local: str, template: str) -> bool:
         ...
 
     def send_video(
@@ -90,6 +107,7 @@ class SubprocessSendClient:
         adb_serial: str = "127.0.0.1:16384",
         frida_remote: str = "127.0.0.1:27042",
         process_name: str = "com.tencent.wework",
+        stop_event: threading.Event | None = None,
     ) -> None:
         self.python_executable = python_executable or sys.executable
         self.module = module or "runtime.wework_re_android.send_engine"
@@ -99,6 +117,17 @@ class SubprocessSendClient:
         self.process_name = process_name
         self._frida_session = None
         self.last_error = ""
+        self.stop_event = stop_event
+        self._active_proc: subprocess.Popen | None = None
+
+    def kill_active_process(self) -> None:
+        """立即杀掉正在执行的子进程。"""
+        proc = self._active_proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
     def _run(self, args: list[str], expected: str) -> bool:
         if bool(getattr(sys, "frozen", False)):
@@ -118,13 +147,22 @@ class SubprocessSendClient:
                 self.account_id,
                 *args,
             ]
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
         )
-        out = f"{proc.stdout}\n{proc.stderr}".strip()
+        self._active_proc = proc
+        try:
+            # 轮询等待子进程结束，同时检查 stop_event
+            while proc.poll() is None:
+                time.sleep(0.1)
+        finally:
+            self._active_proc = None
+        stdout = proc.stdout.read() if proc.stdout else ""
+        stderr = proc.stderr.read() if proc.stderr else ""
+        out = f"{stdout}\n{stderr}".strip()
         if proc.returncode != 0:
             detail = out or f"exit code {proc.returncode}"
             self.last_error = detail[:500]
@@ -148,6 +186,18 @@ class SubprocessSendClient:
             "action=text return=true",
         )
 
+    def send_at(self, *, conv_local: str, body: str) -> bool:
+        return self._run(
+            ["at", "--conv-local", conv_local, f"--body={body}"],
+            "action=at return=true",
+        )
+
+    def send_notice(self, *, conv_local: str, body: str) -> bool:
+        return self._run(
+            ["notice", "--conv-local", conv_local, f"--body={body}"],
+            "action=notice return=true",
+        )
+
     def send_image(self, *, conv_local: str, image_path: str) -> bool:
         return self._run(
             ["image", "--conv-local", conv_local, "--image-path", image_path],
@@ -158,6 +208,12 @@ class SubprocessSendClient:
         return self._run(
             ["oa", "--conv-local", conv_local, "--template", template],
             "action=oa return=true",
+        )
+
+    def send_wxa(self, *, conv_local: str, template: str) -> bool:
+        return self._run(
+            ["--wait-seconds", "8", "wxa", "--conv-local", conv_local, "--template", template],
+            "action=wxa return=true",
         )
 
     def send_video(
@@ -201,6 +257,8 @@ class RunRecord:
     status: RunnerStatus
     error: str = ""
     variant_used: str = ""
+    inner_index: int = -1
+    phase: str = ""
 
 
 class RunCancelled(Exception):
@@ -236,7 +294,6 @@ class BroadcastRunner:
         resolver: Callable[[str], str],
         send_client: SendClient | None = None,
         voice_index_path: str | Path | None = None,
-        perturb_fn: Callable[..., PerturbResult] = create_perturbed_copy,
         rand_fn: Callable[[float, float], float] = random.uniform,
         sleep_fn: Callable[[float], None] = time.sleep,
         progress_cb: Callable[[RunRecord, int, int], None] | None = None,
@@ -244,14 +301,13 @@ class BroadcastRunner:
         run_uuid: str | None = None,
         report_store: ReportStore | None = None,
         report_gc_days: int = 90,
-        retry_delays_seconds: tuple[float, float] = (0.0, 60.0),
+        retry_delays_seconds: tuple[float, ...] = (),
         stop_event: threading.Event | None = None,
     ) -> None:
         self.plan = plan
         self.resolver = resolver
         self.account_id = resolve_account_id(account_id)
-        self.send_client = send_client or SubprocessSendClient(account_id=self.account_id)
-        self.perturb_fn = perturb_fn
+        self.send_client = send_client or SubprocessSendClient(account_id=self.account_id, stop_event=stop_event)
         self.rand_fn = rand_fn
         self.sleep_fn = sleep_fn
         self.progress_cb = progress_cb
@@ -276,106 +332,381 @@ class BroadcastRunner:
         if not text:
             raise ValueError("run_uuid 不能为空")
         self.run_uuid = text
-        view = self.report_store.load_report(text)
-        if only_failed:
-            failed_indexes = self._collect_failed_step_indexes(view.rows)
-            return self._run_from(start_step_index=0, only_step_indexes=failed_indexes)
-        start = view.next_resume_step_index()
-        return self._run_from(start_step_index=start)
+        return self._run_from(start_step_index=0, only_failed=only_failed)
 
-    def _run_from(self, *, start_step_index: int, only_step_indexes: set[int] | None = None) -> RunSummary:
-        sequence_size = len(self.plan.sequence)
-        total_steps = len(self.plan.contacts) * sequence_size
-        start = min(max(0, int(start_step_index)), total_steps)
-        targets = self._collect_targets(
-            total_steps=total_steps,
-            sequence_size=sequence_size,
-            start_step_index=start,
+    def _run_from(
+        self,
+        *,
+        start_step_index: int,
+        only_step_indexes: set[int] | None = None,
+        only_failed: bool = False,
+        only_keys: set[tuple[int, int]] | None = None,
+    ) -> RunSummary:
+        units = expand_send_units(self.plan, load_bundle=self._load_bundle)
+        self._conv_cache = {}
+        self._report_inner_index = -1
+        prior_rows: list[dict[str, object]] = []
+        try:
+            prior_rows = list(self.report_store.load_report(self.run_uuid).rows)
+        except Exception:
+            prior_rows = []
+        selected = select_units(
+            units,
+            prior_rows,
+            only_failed=only_failed,
+            only_keys=only_keys,
             only_step_indexes=only_step_indexes,
+            start_step_index=start_step_index,
         )
-        total = len(targets)
+        total = len(selected)
         summary = RunSummary(run_uuid=self.run_uuid)
         if total < 1:
             self.report_store.export_csv(self.run_uuid)
             return summary
 
         self._append_plan_meta()
-        target_set = set(targets)
-        target_contact_indexes = sorted({idx // sequence_size for idx in targets})
-        last_target_contact = target_contact_indexes[-1] if target_contact_indexes else -1
         done = 0
-        for c_idx, contact in enumerate(self.plan.contacts):
+        failed_bundles: set[int] = set()
+        selected_keys = {unit.key for unit in selected}
+        for pos, unit in enumerate(selected):
             if self._should_stop():
+                self._mark_paused(summary, unit, done=done, total=total)
                 break
-            if sequence_size < 1:
-                break
-            contact_start = c_idx * sequence_size
-            selected_seq_indexes = [
-                s_idx for s_idx in range(sequence_size) if (contact_start + s_idx) in target_set
-            ]
-            if not selected_seq_indexes:
-                continue
-            processed_contact = False
-            contact_name = contact.display_name
-            conv_local = self._resolve_contact(contact)
+            conv_local = self._conv_for_unit(unit)
             if conv_local is None:
-                for s_idx in selected_seq_indexes:
-                    step = self.plan.sequence[s_idx]
-                    done += 1
-                    processed_contact = True
-                    step_idx = contact_start + s_idx
-                    self._append_report(
-                        step_index=step_idx,
-                        sequence_index=s_idx,
-                        contact=contact_name,
-                        conv_local="",
-                        step_type=step.type,
-                        status="resolve_failed",
-                        error="contact not found",
-                        attempt=0,
-                    )
-                    self._append_record(
-                        summary,
-                        RunRecord(
-                            contact=contact_name,
-                            conv_local=None,
-                            step_index=step_idx,
-                            sequence_index=s_idx,
-                            step_type=step.type,
-                            status="resolve_failed",
-                            error="contact not found",
-                        ),
-                        done=done,
-                        total=total,
-                    )
-                if processed_contact and c_idx < last_target_contact:
-                    self._sleep_gap(self.plan.contact_gap_seconds)
-                continue
-
-            for pos, s_idx in enumerate(selected_seq_indexes):
-                if self._should_stop():
-                    break
-                step = self.plan.sequence[s_idx]
-                step_idx = contact_start + s_idx
-                processed_contact = True
-                record = self._run_step(
-                    contact=contact_name,
-                    conv_local=conv_local,
-                    index=s_idx,
-                    step_index=step_idx,
-                    step=step,
-                )
                 done += 1
+                record = self._finish_unit(
+                    summary,
+                    unit,
+                    status="resolve_failed",
+                    error="contact not found",
+                    conv_local="",
+                    done=done,
+                    total=total,
+                )
+                self._note_bundle_failure(summary, unit, failed_bundles, done=done, total=total)
+                if record.status == "paused":
+                    break
+                self._sleep_between(unit, selected, pos, selected_keys)
+                continue
+            self._emit_phase(unit, phase="prepare", done=done, total=total, conv_local=conv_local)
+            if self._should_stop():
+                self._mark_paused(summary, unit, done=done, total=total)
+                break
+            self._emit_phase(unit, phase="sending", done=done, total=total, conv_local=conv_local)
+            record = self._run_unit(unit, conv_local=conv_local)
+            if record.status == "paused" or (self._should_stop() and record.status != "sent"):
+                if record.status != "paused":
+                    record = self._rewrite_as_paused(unit, conv_local=conv_local)
                 self._append_record(summary, record, done=done, total=total)
-                if pos < len(selected_seq_indexes) - 1:
-                    self._sleep_gap(self.plan.msg_gap_seconds)
-
+                break
+            done += 1
+            self._append_record(summary, record, done=done, total=total)
+            if record.status == "failed":
+                self._note_bundle_failure(summary, unit, failed_bundles, done=done, total=total)
+            if record.status == "sent" and self._should_stop():
+                nxt = selected[pos + 1] if pos + 1 < len(selected) else None
+                if nxt is not None:
+                    self._mark_paused(summary, nxt, done=done, total=total)
+                break
             if self._should_stop():
                 break
-            if processed_contact and c_idx < last_target_contact:
-                self._sleep_gap(self.plan.contact_gap_seconds)
+            self._sleep_between(unit, selected, pos, selected_keys)
         self.report_store.export_csv(self.run_uuid)
         return summary
+
+    def _load_bundle(self, bundle_id: str):
+        return get_bundle(bundle_id, account_id=self.account_id)
+
+    def _conv_for_unit(self, unit: SendUnit) -> str | None:
+        cache = getattr(self, "_conv_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._conv_cache = cache
+        if unit.contact_index in cache:
+            return cache[unit.contact_index]
+        contact = self.plan.contacts[unit.contact_index]
+        resolved = self._resolve_contact(contact)
+        cache[unit.contact_index] = resolved
+        return resolved
+
+    def _unit_record(
+        self,
+        unit: SendUnit,
+        *,
+        status: RunnerStatus,
+        error: str,
+        conv_local: str,
+        phase: str = "",
+        step_type: str = "",
+    ) -> RunRecord:
+        return RunRecord(
+            contact=unit.contact_name,
+            conv_local=conv_local or None,
+            step_index=unit.step_index,
+            sequence_index=unit.sequence_index,
+            step_type=step_type or unit.step_type,
+            status=status,
+            error=error,
+            inner_index=unit.inner_index,
+            phase=phase,
+        )
+
+    def _emit_phase(
+        self,
+        unit: SendUnit,
+        *,
+        phase: str,
+        done: int,
+        total: int,
+        conv_local: str,
+    ) -> None:
+        record = self._unit_record(
+            unit,
+            status="before_send",
+            error="",
+            conv_local=conv_local,
+            phase=phase,
+        )
+        if self.progress_cb is not None:
+            self.progress_cb(record, done, total)
+
+    def _finish_unit(
+        self,
+        summary: RunSummary,
+        unit: SendUnit,
+        *,
+        status: RunnerStatus,
+        error: str,
+        conv_local: str,
+        done: int,
+        total: int,
+        step_type: str = "",
+    ) -> RunRecord:
+        self._report_inner_index = unit.inner_index
+        self._append_report(
+            step_index=unit.step_index,
+            sequence_index=unit.sequence_index,
+            contact=unit.contact_name,
+            conv_local=conv_local,
+            step_type=step_type or unit.step_type,
+            status=status,
+            error=error,
+            attempt=0,
+        )
+        record = self._unit_record(
+            unit,
+            status=status,
+            error=error,
+            conv_local=conv_local,
+            step_type=step_type,
+        )
+        self._append_record(summary, record, done=done, total=total)
+        return record
+
+    def _mark_paused(self, summary: RunSummary, unit: SendUnit, *, done: int, total: int) -> None:
+        self._finish_unit(
+            summary,
+            unit,
+            status="paused",
+            error="用户中断",
+            conv_local="",
+            done=done,
+            total=total,
+        )
+
+    def _note_bundle_failure(
+        self,
+        summary: RunSummary,
+        unit: SendUnit,
+        failed_bundles: set[int],
+        *,
+        done: int,
+        total: int,
+    ) -> None:
+        if unit.presentation not in {"atomic", "expanded"} or unit.inner_index < 0:
+            return
+        if unit.step_index in failed_bundles:
+            return
+        failed_bundles.add(unit.step_index)
+        self._report_inner_index = -1
+        self._append_report(
+            step_index=unit.step_index,
+            sequence_index=unit.sequence_index,
+            contact=unit.contact_name,
+            conv_local="",
+            step_type="bundle",
+            status="failed",
+            error="包内有发送失败",
+            attempt=0,
+        )
+        outer = RunRecord(
+            contact=unit.contact_name,
+            conv_local=None,
+            step_index=unit.step_index,
+            sequence_index=unit.sequence_index,
+            step_type="bundle",
+            status="failed",
+            error="包内有发送失败",
+            inner_index=-1,
+        )
+        if self.progress_cb is not None:
+            self.progress_cb(outer, done, total)
+        summary.records.append(outer)
+
+    def _rewrite_as_paused(self, unit: SendUnit, *, conv_local: str) -> RunRecord:
+        self._report_inner_index = unit.inner_index
+        self._append_report(
+            step_index=unit.step_index,
+            sequence_index=unit.sequence_index,
+            contact=unit.contact_name,
+            conv_local=conv_local,
+            step_type=unit.step_type,
+            status="paused",
+            error="用户中断",
+            attempt=1,
+        )
+        return self._unit_record(unit, status="paused", error="用户中断", conv_local=conv_local)
+
+    def _run_unit(self, unit: SendUnit, *, conv_local: str) -> RunRecord:
+        self._report_inner_index = unit.inner_index
+        if unit.blocked_reason:
+            self._append_report(
+                step_index=unit.step_index,
+                sequence_index=unit.sequence_index,
+                contact=unit.contact_name,
+                conv_local=conv_local,
+                step_type=unit.step_type,
+                status="blocked",
+                error=unit.blocked_reason,
+                attempt=0,
+            )
+            return self._unit_record(
+                unit,
+                status="blocked",
+                error=unit.blocked_reason,
+                conv_local=conv_local,
+            )
+        if unit.leaf is not None:
+            record = self._run_step(
+                contact=unit.contact_name,
+                conv_local=conv_local,
+                index=unit.sequence_index,
+                step_index=unit.step_index,
+                step=unit.leaf,
+            )
+            record.inner_index = unit.inner_index
+            return record
+        ok = False
+        error = "send returned false"
+        try:
+            ok = self._send_bundle_item(
+                conv_local=conv_local,
+                asset_type=unit.bundle_asset_type,
+                item_id=unit.bundle_item_id,
+            )
+            if not ok:
+                error = str(getattr(self.send_client, "last_error", "") or error)
+        except RunCancelled:
+            error = "用户中断"
+            ok = False
+        except Exception as exc:
+            error = str(exc)
+            ok = False
+        status: RunnerStatus = "sent" if ok else ("paused" if error == "用户中断" else "failed")
+        self._append_report(
+            step_index=unit.step_index,
+            sequence_index=unit.sequence_index,
+            contact=unit.contact_name,
+            conv_local=conv_local,
+            step_type=unit.step_type,
+            status="sent" if ok else status,
+            error="" if ok else error,
+            attempt=1,
+        )
+        return self._unit_record(
+            unit,
+            status="sent" if ok else status,
+            error="" if ok else error,
+            conv_local=conv_local,
+        )
+
+    def _send_bundle_item(self, *, conv_local: str, asset_type: str, item_id: str) -> bool:
+        kind = asset_type.strip().lower()
+        if self._should_stop():
+            raise RunCancelled()
+        if kind == "voice":
+            entry = self._voice_map.get(item_id)
+            if entry is None:
+                raise KeyError(f"素材包引用的 voice 不存在: {item_id}")
+            return bool(
+                self.send_client.send_voice(
+                    conv_local=conv_local,
+                    silk_path=self._voice_path(entry.file),
+                    voice_time=entry.duration,
+                )
+            )
+        if kind == "text":
+            body, _ = self._resolve_text_body(
+                TextStep(type="text", template_id=item_id, variant_pick="random", text_kind="text")
+            )
+            return bool(self.send_client.send_text(conv_local=conv_local, body=body))
+        if kind == "link":
+            if self._legacy_link_is_wxa(item_id):
+                return bool(self._send_wxa(conv_local=conv_local, template_id=item_id))
+            body, _ = self._resolve_text_body(
+                TextStep(type="text", template_id=item_id, variant_pick="random", text_kind="link")
+            )
+            return bool(self.send_client.send_text(conv_local=conv_local, body=body))
+        if kind == "wxa":
+            return bool(self._send_wxa(conv_local=conv_local, template_id=item_id))
+        if kind in {"oa", "doc", "channel"}:
+            _ = load_oa_template(item_id, account_id=self.account_id)
+            return bool(self.send_client.send_oa(conv_local=conv_local, template=item_id))
+        if kind == "image":
+            payload = load_image_template(item_id, account_id=self.account_id)
+            path = str(payload.get("path", "") or payload.get("file_path", "")).strip()
+            if not path:
+                raise ValueError(f"素材包引用的 image 缺少路径: {item_id}")
+            return bool(self.send_client.send_image(conv_local=conv_local, image_path=path))
+        if kind == "video":
+            payload = load_video_template(item_id, account_id=self.account_id)
+            video_path = str(payload.get("path", "") or payload.get("video_path", "")).strip()
+            thumb_path = str(payload.get("thumb_path", "")).strip()
+            duration = payload.get("duration")
+            duration_int = int(duration) if isinstance(duration, int | float) else None
+            if not video_path:
+                raise ValueError(f"素材包引用的 video 缺少路径: {item_id}")
+            return bool(
+                self.send_client.send_video(
+                    conv_local=conv_local,
+                    video_path=video_path,
+                    thumb_path=thumb_path,
+                    duration=duration_int,
+                )
+            )
+        raise NotImplementedError(f"素材包内暂不支持类型: {kind}")
+
+    def _sleep_between(
+        self,
+        unit: SendUnit,
+        selected: list[SendUnit],
+        pos: int,
+        _selected_keys: set[tuple[int, int]],
+    ) -> None:
+        if self._should_stop() or pos + 1 >= len(selected):
+            return
+        nxt = selected[pos + 1]
+        if nxt.contact_index != unit.contact_index:
+            self._sleep_contact_gap()
+            return
+        neighbor = (
+            nxt.step_index == unit.step_index and nxt.inner_index == unit.inner_index + 1
+        ) or (
+            nxt.contact_index == unit.contact_index and nxt.sequence_index == unit.sequence_index + 1
+        )
+        if neighbor and unit.gap_after_seconds > 0:
+            self._interruptible_sleep(unit.gap_after_seconds)
 
     def _collect_targets(
         self,
@@ -434,6 +765,8 @@ class BroadcastRunner:
             {
                 "type": "plan_meta",
                 "plan": self.plan.model_dump(mode="json"),
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "name": self.plan.name,
             },
         )
 
@@ -496,6 +829,9 @@ class BroadcastRunner:
         last_variant = ""
         total_attempts = len(self.retry_delays_seconds) + 1
         for attempt in range(1, total_attempts + 1):
+            if self._should_stop():
+                last_error = "用户中断"
+                break
             if getattr(self.send_client, "requires_preflight", True) and hasattr(
                 self.send_client, "ensure_ready"
             ):
@@ -549,9 +885,15 @@ class BroadcastRunner:
                     )
                 detail = getattr(self.send_client, "last_error", "")
                 last_error = detail.strip() or "send returned false"
+            except RunCancelled:
+                last_error = "用户中断"
+                break
             except Exception as exc:
                 last_error = str(exc)
 
+            if self._should_stop() or last_error == "用户中断":
+                last_error = "用户中断"
+                break
             if attempt < total_attempts:
                 next_wait = self.retry_delays_seconds[attempt - 1]
                 self._append_report(
@@ -571,13 +913,14 @@ class BroadcastRunner:
                 continue
             break
 
+        final_status: RunnerStatus = "paused" if last_error == "用户中断" else "failed"
         self._append_report(
             step_index=step_index,
             sequence_index=index,
             contact=contact,
             conv_local=conv_local,
             step_type=step.type,
-            status="failed",
+            status=final_status,
             error=last_error,
             attempt=total_attempts,
             variant_used=last_variant,
@@ -588,7 +931,7 @@ class BroadcastRunner:
             step_index=step_index,
             sequence_index=index,
             step_type=step.type,
-            status="failed",
+            status=final_status,
             error=last_error,
             variant_used=last_variant,
         )
@@ -599,30 +942,37 @@ class BroadcastRunner:
             if entry is None:
                 raise KeyError(f"voice_id 不存在: {step.voice_id}")
             silk_path = self._voice_path(entry.file)
-            send_path = silk_path
-            if self.plan.perturb and Path(silk_path).exists():
-                perturbed = self.perturb_fn(silk_path)
-                send_path = str(perturbed.output)
             return DispatchResult(
                 ok=self.send_client.send_voice(
                     conv_local=conv_local,
-                    silk_path=send_path,
+                    silk_path=silk_path,
                     voice_time=entry.duration,
                 )
             )
+        if isinstance(step, (OaStep, DocStep, ChannelStep)):
+            return DispatchResult(
+                ok=self.send_client.send_oa(conv_local=conv_local, template=step.template_id)
+            )
+        if isinstance(step, WxaStep):
+            return DispatchResult(ok=self._send_wxa(conv_local=conv_local, template_id=step.template_id))
         if isinstance(step, TextStep):
+            if step.text_kind == "link" and step.template_id and self._legacy_link_is_wxa(step.template_id):
+                return DispatchResult(ok=self._send_wxa(conv_local=conv_local, template_id=step.template_id))
             body, used = self._resolve_text_body(step)
             return DispatchResult(
                 ok=self.send_client.send_text(conv_local=conv_local, body=body),
                 variant_used=used,
             )
+        if isinstance(step, (AtStep, NoticeStep)):
+            body, used = self._resolve_text_body(step)
+            sender = self.send_client.send_at if isinstance(step, AtStep) else self.send_client.send_notice
+            return DispatchResult(
+                ok=sender(conv_local=conv_local, body=body),
+                variant_used=used,
+            )
         if isinstance(step, ImageStep):
             return DispatchResult(
                 ok=self.send_client.send_image(conv_local=conv_local, image_path=step.path)
-            )
-        if isinstance(step, OaStep):
-            return DispatchResult(
-                ok=self.send_client.send_oa(conv_local=conv_local, template=step.template_id)
             )
         if isinstance(step, BundleStep):
             return DispatchResult(ok=self._dispatch_bundle(conv_local=conv_local, bundle_id=step.bundle_id))
@@ -635,17 +985,40 @@ class BroadcastRunner:
                     duration=step.duration,
                 )
             )
-        if isinstance(step, WxaStep):
-            raise NotImplementedError(f"{step.type} 尚未接入发送实现")
         raise NotImplementedError(f"{step.type} 尚未接入发送实现")
 
+    def _legacy_link_is_wxa(self, template_id: str) -> bool:
+        """旧界面把小程序卡片存成 link。文字链接模板优先，其余能读到卡片字段的按小程序发送。"""
+        item_id = template_id.strip()
+        if not item_id:
+            return False
+        try:
+            self.voice_lib.get_text_template(item_id)
+            return False
+        except Exception:
+            pass
+        try:
+            payload = load_wxa_template(item_id, account_id=self.account_id)
+        except Exception:
+            return False
+        return has_card_fields(payload)
+
+    def _send_wxa(self, *, conv_local: str, template_id: str) -> bool:
+        payload = load_wxa_template(template_id, account_id=self.account_id)
+        if not has_card_fields(payload):
+            raise ValueError(f"小程序模板缺少卡片字段: {template_id}")
+        return self.send_client.send_wxa(conv_local=conv_local, template=template_id)
+
     def _dispatch_bundle(self, *, conv_local: str, bundle_id: str) -> bool:
+        """发送素材包：逐条发送 items，在 items 之间按 step_gaps 等待。"""
         bundle = get_bundle(bundle_id, account_id=self.account_id)
         if bundle is None:
             raise KeyError(f"bundle_id 不存在: {bundle_id}")
         if not bundle.items:
             raise ValueError(f"素材包为空: {bundle_id}")
-        for item in bundle.items:
+        for idx, item in enumerate(bundle.items):
+            if self._should_stop():
+                raise RunCancelled()
             asset_type = item.asset_type.strip().lower()
             item_id = item.item_id.strip()
             if asset_type == "voice":
@@ -653,19 +1026,27 @@ class BroadcastRunner:
                 if entry is None:
                     raise KeyError(f"素材包引用的 voice 不存在: {item_id}")
                 silk_path = self._voice_path(entry.file)
-                send_path = silk_path
-                if self.plan.perturb and Path(silk_path).exists():
-                    perturbed = self.perturb_fn(silk_path)
-                    send_path = str(perturbed.output)
                 ok = self.send_client.send_voice(
                     conv_local=conv_local,
-                    silk_path=send_path,
+                    silk_path=silk_path,
                     voice_time=entry.duration,
                 )
             elif asset_type == "text":
-                body, _ = self._resolve_text_body(TextStep(type="text", template_id=item_id, variant_pick="random"))
+                body, _ = self._resolve_text_body(
+                    TextStep(type="text", template_id=item_id, variant_pick="random", text_kind="text")
+                )
                 ok = self.send_client.send_text(conv_local=conv_local, body=body)
-            elif asset_type == "oa":
+            elif asset_type == "link":
+                if self._legacy_link_is_wxa(item_id):
+                    ok = self._send_wxa(conv_local=conv_local, template_id=item_id)
+                else:
+                    body, _ = self._resolve_text_body(
+                        TextStep(type="text", template_id=item_id, variant_pick="random", text_kind="link")
+                    )
+                    ok = self.send_client.send_text(conv_local=conv_local, body=body)
+            elif asset_type == "wxa":
+                ok = self._send_wxa(conv_local=conv_local, template_id=item_id)
+            elif asset_type in {"oa", "doc", "channel"}:
                 _ = load_oa_template(item_id, account_id=self.account_id)
                 ok = self.send_client.send_oa(conv_local=conv_local, template=item_id)
             elif asset_type == "image":
@@ -692,6 +1073,10 @@ class BroadcastRunner:
                 raise NotImplementedError(f"素材包内暂不支持类型: {asset_type}")
             if not ok:
                 return False
+            # 在 bundle items 之间按 step_gaps 等待
+            if idx < len(bundle.items) - 1 and idx < len(bundle.step_gaps):
+                gap = max(3.0, bundle.step_gaps[idx])
+                self._interruptible_sleep(gap)
         return True
 
     def _voice_path(self, file_field: str) -> str:
@@ -715,8 +1100,16 @@ class BroadcastRunner:
             if chunk > 0:
                 self.sleep_fn(chunk)
 
-    def _sleep_gap(self, gap: tuple[float, float]) -> None:
-        sec = float(self.rand_fn(float(gap[0]), float(gap[1])))
+    def _sleep_step_gap(self, seq_index: int) -> None:
+        """发完 sequence[seq_index] 后按 plan.step_gaps[seq_index] 等待。"""
+        if seq_index < 0 or seq_index >= len(self.plan.step_gaps):
+            return
+        sec = max(3.0, float(self.plan.step_gaps[seq_index]))
+        self._interruptible_sleep(sec)
+
+    def _sleep_contact_gap(self) -> None:
+        """发完一个联系人所有消息后按 plan.contact_gap 等待。"""
+        sec = max(1.0, float(self.plan.contact_gap))
         self._interruptible_sleep(sec)
 
     def _append_report(
@@ -737,6 +1130,7 @@ class BroadcastRunner:
             "run_uuid": self.run_uuid,
             "step_index": int(step_index),
             "sequence_index": int(sequence_index),
+            "inner_index": int(getattr(self, "_report_inner_index", -1)),
             "contact": contact,
             "conv_local": conv_local,
             "type": step_type,
@@ -750,7 +1144,7 @@ class BroadcastRunner:
             payload["next_wait_seconds"] = float(next_wait_seconds)
         self.report_store.append(self.run_uuid, payload)
 
-    def _resolve_text_body(self, step: TextStep) -> tuple[str, str]:
+    def _resolve_text_body(self, step: TextStep | AtStep | NoticeStep) -> tuple[str, str]:
         if step.template_id:
             template = self._text_template_map.get(step.template_id)
             if template is None:

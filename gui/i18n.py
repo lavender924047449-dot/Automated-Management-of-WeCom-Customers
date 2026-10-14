@@ -9,9 +9,16 @@ ASSET_TYPE_ZH: dict[str, str] = {
     "voice": "语音",
     "image": "图片",
     "video": "视频",
-    "link": "小程序链接",
+    "wxa": "小程序",
     "oa": "公众号卡片",
+    "doc": "企微文档",
+    "channel": "视频号",
     "bundle": "素材包",
+}
+
+STEP_TYPE_ZH: dict[str, str] = {
+    "at": "@所有人",
+    "notice": "群公告",
 }
 
 ASSET_TYPE_FILTER_OPTIONS: list[str] = ["全部", *ASSET_TYPE_ZH.values()]
@@ -26,12 +33,17 @@ CHOICE_BUTTON_STYLE = (
 PROBE_LISTENER_LABELS = {
     "fta": "语音捕获",
     "oa": "公众号卡片",
-    "wxa": "小程序卡片",
+    "wxa": "小程序",
 }
 
 
 def asset_type_to_zh(asset_type: str) -> str:
-    return ASSET_TYPE_ZH.get(str(asset_type).strip().lower(), str(asset_type))
+    key = str(asset_type).strip().lower()
+    if key == "link":
+        return ASSET_TYPE_ZH["text"]
+    if key in STEP_TYPE_ZH:
+        return STEP_TYPE_ZH[key]
+    return ASSET_TYPE_ZH.get(key, str(asset_type))
 
 
 def asset_type_from_filter(label: str) -> str:

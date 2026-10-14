@@ -61,6 +61,11 @@ def account_reports_dir(account_id: str | None) -> Path:
     return data_root_for(account_id) / REPORTS_DIR_NAME
 
 
+def account_label_names_path(account_id: str | None) -> Path:
+    """账号级标签 id→中文名 缓存文件（Step 2: 由刷新联系人时写入，替代全局手写 JSON）。"""
+    return data_root_for(account_id) / "label_names.json"
+
+
 __all__ = [
     "VOICE_LIB_ROOT",
     "VOICE_LIB_ROOT_FALLBACK",
@@ -75,4 +80,5 @@ __all__ = [
     "account_contacts_cache_path",
     "account_plans_dir",
     "account_reports_dir",
+    "account_label_names_path",
 ]

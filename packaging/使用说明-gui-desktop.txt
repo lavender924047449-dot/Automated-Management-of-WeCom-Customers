@@ -4,6 +4,7 @@
 - 请把 `企微客户自动化管理工具.exe` 和 `vendor` 文件夹放在同一目录。
 - `vendor` 目录内必须包含以下文件，请勿单独删除任何一个：
   - `ffmpeg/ffmpeg.exe`
+  - `silk/silk_v3_decoder.exe`
   - `frida-server-16.7.19-android-x86_64`
   - `adb.exe`
   - `AdbWinApi.dll`

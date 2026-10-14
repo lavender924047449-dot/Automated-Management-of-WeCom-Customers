@@ -63,3 +63,22 @@ def test_gc_cache_lru_removes_oldest(tmp_path):
     assert removed == 1
     assert not old.exists()
     assert new.exists()
+
+
+def test_voice_decode_failure_is_not_exposed_as_playable_silk(tmp_path, monkeypatch):
+    local_silk = tmp_path / "broken.silk"
+    local_silk.write_bytes(b"not-decodable")
+    service = PreviewService(cache_dir=tmp_path)
+    monkeypatch.setattr(service, "_resolve_voice_source", lambda _payload: str(local_silk))
+    monkeypatch.setattr(service, "_decode_silk_to_wav", lambda _path: None)
+
+    assert service.pull_preview({"asset_type": "voice", "file": "broken.silk"}) == ""
+
+
+def test_voice_relative_path_resolves_under_voice_library(tmp_path: Path):
+    from app.broadcast.paths import VOICE_LIB_ROOT
+
+    service = PreviewService(cache_dir=tmp_path)
+    assert service._resolve_voice_source({"path": "relative/demo.silk"}) == (
+        f"{VOICE_LIB_ROOT}/relative/demo.silk"
+    )

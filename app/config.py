@@ -32,11 +32,15 @@ def project_root() -> Path:
     可写的应用根目录。
 
     - 开发态: 仓库根 (app/ 的上一级)
+    - 目录分发: 启动器设置 TESTVOICE_HOME 为安装目录（data、vendor、logs 在这里）
     - 打包态: exe 所在目录 (不是 _internal / _MEIPASS)
       这样 config.yaml、logs、runtime、samples 都落在用户能看见的文件夹里。
     """
     if is_frozen():
         return Path(sys.executable).resolve().parent
+    home = os.environ.get("TESTVOICE_HOME", "").strip()
+    if home:
+        return Path(home).expanduser().resolve()
     return Path(__file__).resolve().parent.parent
 
 

@@ -1,44 +1,31 @@
-"""增加素材：F3.5 单一采集口（voice + image + video + oa）+ 本轮已捕获面板。
+"""增加素材：从企微文件传输助手采集文字 / 语音 / 图片 / 视频 / 公众号 / 小程序。
 
-改动路线：
-- F1.6 起 voice 走 `fta_capture_lite`；
-- F3.1/F3.4 加时长选择 + `CaptureClient` 起停 + 错误弹窗；
-- **F3.5 合并**：`fta_capture_lite` 单一 attach 收全 4 类，删掉 image/video/oa 各自的
-  probe 子进程与 kind picker；wxa 因缺 mType 证据暂缓合并，保留 legacy 独立入口。
-- 新增 **"本轮已捕获" 面板**：捕获事件到达即入表 + 双击名字列就地重命名 →
-  写回各自 store 并去掉 `unnamed` flag → 本轮结束自动清空，条目仍留在
-  "已保存的素材"（未命名的以 `未命名 #NNN` 展示，F3.2 扩展）。
+采集结果先进入「本轮已捕获」。双击名字列命名后才写入素材库。
 """
 
 from __future__ import annotations
 
-import sys
 import time
-import uuid
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from PySide6.QtCore import QObject, QProcess, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
-    QGroupBox,
+    QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMenu,
     QMessageBox,
     QPushButton,
-    QScrollArea,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -47,11 +34,38 @@ from app.broadcast import image_templates as image_tpl_mod
 from app.broadcast import oa_templates as oa_tpl_mod
 from app.broadcast import video_templates as video_tpl_mod
 from app.broadcast import wxa_templates as wxa_tpl_mod
+from app.broadcast.asset_bundles import canon_asset_type
+from app.broadcast.asset_names import asset_name_conflict
 from app.broadcast.capture_client import CaptureClient
 from app.broadcast.library import VoiceLibrary
 from app.broadcast.paths import account_voice_index_path
+from app.broadcast.preview import PreviewService
 from app.config import resolve_path
-from gui.widgets.pending_template_dialog import PendingTemplateDialog
+from gui.copy_support import add_copy_action, prepare_context_selection
+from gui.i18n import asset_type_to_zh
+from gui.widgets.asset_preview import AssetPreviewPanel
+
+
+def _capture_exit_reason(tail: list[str]) -> str:
+    """从采集子进程 stderr 里抽出一行能看懂的原因，跳过补丁日志和 traceback。"""
+    skip_bits = (
+        "CREATE_NO_WINDOW",
+        "Traceback",
+        "File \"",
+        "File '",
+        "raise SystemExit",
+        "subprocess.",
+        "^^^^^^^^",
+        "frozen runpy",
+    )
+    for line in reversed(tail):
+        text = line.strip()
+        if not text:
+            continue
+        if any(bit in text for bit in skip_bits):
+            continue
+        return text[:300]
+    return ""
 
 
 class _CaptureBridge(QObject):
@@ -65,7 +79,6 @@ class LibraryIngestTab(QWidget):
     """FTA 素材采集入口（F3.5 单一采集口）。"""
 
     assetsChanged = Signal()
-    unnamedCountChanged = Signal(int)
 
     _FTA_REMOTE_ID = "10006"
     _DURATION_OPTIONS = (5, 10, 30)  # 分钟
@@ -75,38 +88,35 @@ class LibraryIngestTab(QWidget):
     _COL_NAME = 1
     _COL_EXTRA = 2
     _COL_TIME = 3
+    _COL_STATUS = 4
 
-    def __init__(self) -> None:
+    def __init__(self, *, preview_service_provider: Callable[[], PreviewService] | None = None) -> None:
         super().__init__()
         self._account_id = "default"
+        self._preview_service_provider = preview_service_provider
 
         # F3.5：单一 CaptureClient 覆盖 voice/image/video/oa
         self._client: CaptureClient | None = None
         self._bridge: _CaptureBridge | None = None
         self._started_ms: float = 0.0
         self._deadline_ms: float = 0.0
-        self._counts: dict[str, int] = {"voice": 0, "image": 0, "video": 0, "oa": 0}
+        self._counts: dict[str, int] = {
+            "voice": 0,
+            "image": 0,
+            "video": 0,
+            "oa": 0,
+            "doc": 0,
+            "channel": 0,
+            "wxa": 0,
+            "text": 0,
+        }
         # F3.4：Windows 上 SIGTERM 强杀 exit=1 与真异常无法从 code 区分，用旗标区分
         self._user_stopped: bool = False
         # 本轮已捕获条目：{template_id: {kind, name, extra, ts_iso, row_idx}}
         self._session_rows: dict[str, dict[str, Any]] = {}
         self._session_updating = False  # 防 itemChanged 递归
 
-        # wxa 保留 legacy probe（缺 mType 证据，本轮不合并）
-        self._wxa_process: QProcess | None = None
-
-        # pending 目录轮询（历史遗留 pending 文件 + wxa 走 pending 流程）
-        self._pending_seen: set[str] = set()
-        self._pending_dialog_open = False
-        self._variant_updating = False
-
         self._build_ui()
-        self.assetsChanged.connect(self._refresh_variant_picker)
-
-        self._pending_timer = QTimer(self)
-        self._pending_timer.setInterval(3000)
-        self._pending_timer.timeout.connect(self._poll_pending_templates)
-        self._pending_timer.start()
 
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(1000)
@@ -116,15 +126,19 @@ class LibraryIngestTab(QWidget):
     # UI build
     # ==================================================================
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
+        root = QHBoxLayout(self)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 8, 0)
 
         hint = QLabel(
-            "开启后，对 FTA 发送的语音 / 图片 / 视频 / 公众号卡片会实时进入下方"
-            "「本轮已捕获」列表。双击「名字」列即可命名；关闭采集后条目自动"
-            "归档到「已保存的素材」子页。"
+            "开启后，在企微「文件传输助手」里发送的文字 / 语音 / 图片 / 视频 / 公众号 / "
+            "企微文档 / 视频号 / 小程序会进入下方「本轮已捕获」列表。"
+            "双击「名字」列命名后才会写入素材库。"
         )
         hint.setWordWrap(True)
-        root.addWidget(hint)
+        left_layout.addWidget(hint)
 
         dur_bar = QHBoxLayout()
         dur_bar.addWidget(QLabel("采集时长"))
@@ -134,78 +148,48 @@ class LibraryIngestTab(QWidget):
         self._dur_pick.setCurrentIndex(1)  # 默认 10 分钟
         dur_bar.addWidget(self._dur_pick)
         dur_bar.addStretch(1)
-        root.addLayout(dur_bar)
+        left_layout.addLayout(dur_bar)
+
+        notice = QLabel("注意：只有被命名的素材会保存到素材库")
+        notice.setWordWrap(True)
+        notice.setStyleSheet("font-weight: 600;")
+        left_layout.addWidget(notice)
 
         self._btn_toggle = QPushButton("开始录素材")
         self._btn_toggle.setCheckable(True)
         self._btn_toggle.clicked.connect(self._toggle_capture)
-        root.addWidget(self._btn_toggle)
+        left_layout.addWidget(self._btn_toggle)
 
         self._status_label = QLabel("未运行")
-        root.addWidget(self._status_label)
+        left_layout.addWidget(self._status_label)
 
-        captured_wrap = QWidget()
-        captured_layout = QVBoxLayout(captured_wrap)
-        captured_layout.setContentsMargins(0, 0, 0, 0)
-        captured_layout.addWidget(QLabel("本轮已捕获（双击「名字」列命名）："))
-        self._captured_table = QTableWidget(0, 4)
-        self._captured_table.setHorizontalHeaderLabels(["类型", "名字", "详情", "时间"])
+        left_layout.addWidget(QLabel("本轮已捕获（双击「名字」列命名）："))
+        self._captured_table = QTableWidget(0, 5)
+        self._captured_table.setHorizontalHeaderLabels(["类型", "名字", "详情", "时间", "状态"])
         header = self._captured_table.horizontalHeader()
         header.setSectionResizeMode(self._COL_KIND, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(self._COL_NAME, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(self._COL_EXTRA, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(self._COL_TIME, QHeaderView.ResizeMode.ResizeToContents)
-        self._captured_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        # 支持鼠标长拉 / Ctrl+Click 多选，右键弹菜单删除
+        header.setSectionResizeMode(self._COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
+        self._captured_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self._captured_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._captured_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed
+            QAbstractItemView.EditTrigger.EditKeyPressed
         )
+        self._captured_table.cellDoubleClicked.connect(self._on_captured_cell_double_clicked)
         self._captured_table.itemChanged.connect(self._on_captured_item_changed)
         self._captured_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._captured_table.customContextMenuRequested.connect(self._on_captured_context_menu)
-        captured_layout.addWidget(self._captured_table, 1)
+        left_layout.addWidget(self._captured_table, 1)
+        clear_row = QHBoxLayout()
+        self._btn_clear_captured = QPushButton("清空")
+        self._btn_clear_captured.clicked.connect(self._clear_session_panel)
+        clear_row.addWidget(self._btn_clear_captured)
+        clear_row.addStretch(1)
+        left_layout.addLayout(clear_row)
 
-        # 手工创建区（F3.6）：文字 / 文字变体 / 小程序链接
-        # 与 FTA 抓取共用同一「本轮已捕获」面板，保持视觉与操作一致。
-        manual_bar = QHBoxLayout()
-        manual_bar.addWidget(self._build_text_group(), 1)
-        manual_bar.addWidget(self._build_variant_group(), 1)
-        manual_bar.addWidget(self._build_link_group(), 1)
-
-        tool_bar = QHBoxLayout()
-        self._btn_poll_now = QPushButton("立即检查待确认（wxa/legacy）")
-        self._btn_poll_now.clicked.connect(self._poll_pending_templates)
-        tool_bar.addWidget(self._btn_poll_now)
-        self._btn_wxa = QPushButton("wxa 采集（legacy · 独立子进程）")
-        self._btn_wxa.setCheckable(True)
-        self._btn_wxa.clicked.connect(self._toggle_wxa)
-        tool_bar.addWidget(self._btn_wxa)
-        tool_bar.addStretch(1)
-
-        bottom_wrap = QWidget()
-        bottom_layout = QVBoxLayout(bottom_wrap)
-        bottom_layout.setContentsMargins(0, 0, 0, 0)
-        bottom_layout.addLayout(manual_bar)
-        bottom_layout.addLayout(tool_bar)
-
-        bottom_scroll = QScrollArea()
-        bottom_scroll.setWidgetResizable(True)
-        bottom_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        bottom_scroll.setWidget(bottom_wrap)
-        captured_wrap.setMinimumHeight(72)
-        bottom_scroll.setMinimumHeight(72)
-
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(captured_wrap)
-        splitter.addWidget(bottom_scroll)
-        splitter.setChildrenCollapsible(True)
-        splitter.setCollapsible(0, True)
-        splitter.setCollapsible(1, True)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([420, 280])
-        root.addWidget(splitter, 1)
+        root.addWidget(left, 1)
 
     # ==================================================================
     # 账号切换 / 全停
@@ -218,12 +202,9 @@ class LibraryIngestTab(QWidget):
         self._account_id = target
         # 避免跨账号污染当前会话捕获视图。
         self._clear_session_panel()
-        self._pending_seen.clear()
-        self._refresh_variant_picker()
 
     def stop_all(self) -> None:
         self._stop_capture()
-        self._stop_wxa_process()
         self._btn_toggle.setChecked(False)
         self._btn_toggle.setText("开始录素材")
         self._dur_pick.setEnabled(True)
@@ -273,7 +254,7 @@ class LibraryIngestTab(QWidget):
         self._bridge = bridge
         self._started_ms = time.time()
         self._deadline_ms = self._started_ms + timeout_seconds
-        self._counts = {"voice": 0, "image": 0, "video": 0, "oa": 0}
+        self._counts = {"voice": 0, "image": 0, "video": 0, "oa": 0, "wxa": 0, "text": 0}
         self._user_stopped = False
         self._status_timer.start()
         return True
@@ -322,12 +303,15 @@ class LibraryIngestTab(QWidget):
 
         # F3.4：Windows terminate exit=1 与真异常无法从 code 区分，用旗标抑制误报
         if code != 0 and not user_stopped:
-            tail = "\n".join((client.stats.stderr_tail if client else [])[-20:])
+            tail_lines = (client.stats.stderr_tail if client else [])[-20:]
+            tail = "\n".join(tail_lines)
             logger.warning("FTA 采集异常退出 code={} stderr_tail={}", code, tail)
+            reason = _capture_exit_reason(tail_lines)
+            detail = f"\n\n{reason}" if reason else ""
             QMessageBox.warning(
                 self,
                 "FTA 采集异常退出",
-                "采集进程异常退出，请重新开始采集。",
+                "采集进程异常退出，请重新开始采集。" + detail,
             )
 
         # 收尾：按钮复位、刷新已保存的素材列表。
@@ -363,11 +347,13 @@ class LibraryIngestTab(QWidget):
         "image": "图片",
         "video": "视频",
         "oa": "公众号",
+        "doc": "企微文档",
+        "channel": "视频号",
+        "wxa": "小程序",
         "text": "文字",
-        "link": "小程序链接",
     }
 
-    def _append_captured_row(self, kind: str, payload: dict, *, name: str = "") -> None:
+    def _append_captured_row(self, kind: str, payload: dict, *, name: str = "", saved: bool = False) -> None:
         item_id = str(payload.get("id", "")).strip()
         if not item_id:
             return
@@ -379,6 +365,8 @@ class LibraryIngestTab(QWidget):
             "name": display_name,
             "extra": extra,
             "ts": ts_iso,
+            "saved": bool(saved),
+            "source": dict(payload),
         }
         self._render_session_panel()
         # 选中最新加的行，方便用户直接按 F2 或双击命名
@@ -404,15 +392,16 @@ class LibraryIngestTab(QWidget):
         if kind == "video":
             sz = int(payload.get("size") or -1)
             return f"{sz} B" if sz > 0 else ""
-        if kind == "oa":
+        if kind in {"oa", "doc", "channel"}:
             title = str(payload.get("title") or "").strip()
             return title[:40] or str(payload.get("url", ""))[:40]
+        if kind == "wxa":
+            title = str(payload.get("title") or "").strip()
+            app_name = str(payload.get("appName") or "").strip()
+            return title[:40] or app_name[:40]
         if kind == "text":
-            # 手工创建：payload 里带首条变体（`preview`）
-            preview = str(payload.get("preview") or "").strip()
+            preview = str(payload.get("preview") or payload.get("body") or "").strip()
             return preview[:20]
-        if kind == "link":
-            return str(payload.get("url") or "").strip()[:40]
         return ""
 
     def _render_session_panel(self) -> None:
@@ -429,8 +418,21 @@ class LibraryIngestTab(QWidget):
                 self._captured_table.setItem(r, self._COL_NAME, name_item)
                 self._captured_table.setItem(r, self._COL_EXTRA, self._readonly(row["extra"]))
                 self._captured_table.setItem(r, self._COL_TIME, self._readonly(row["ts"]))
+                self._captured_table.setItem(
+                    r,
+                    self._COL_STATUS,
+                    self._readonly("✓ 已保存" if row.get("saved") else "待命名，尚未保存"),
+                )
         finally:
             self._session_updating = False
+
+    def _on_captured_cell_double_clicked(self, row: int, column: int) -> None:
+        if column == self._COL_NAME:
+            item = self._captured_table.item(row, self._COL_NAME)
+            if item is not None:
+                self._captured_table.editItem(item)
+            return
+        self._open_captured_detail(row)
 
     def _on_captured_item_changed(self, item: QTableWidgetItem) -> None:
         if self._session_updating:
@@ -445,15 +447,26 @@ class LibraryIngestTab(QWidget):
         # 拒绝把占位串 `未命名 #NNN` 落到 store（用户没实际改）
         if not new_name or new_name.startswith("未命名 #"):
             return
+        conflict = asset_name_conflict(
+            self._account_id,
+            canon_asset_type(kind),
+            new_name,
+            exclude_item_id=item_id,
+        )
+        if conflict:
+            QMessageBox.warning(self, "名称重复", conflict)
+            self._render_session_panel()
+            return
         try:
             self._rename_asset(kind, item_id, new_name)
         except Exception as exc:  # noqa: BLE001
             logger.warning("命名素材失败 kind={} item_id={} err={}", kind, item_id, exc)
             QMessageBox.warning(self, "命名失败", "素材命名失败，请稍后重试。")
             return
-        # 更新本地 session 缓存
         if item_id in self._session_rows:
             self._session_rows[item_id]["name"] = new_name
+            self._session_rows[item_id]["saved"] = True
+        self._render_session_panel()
         self.assetsChanged.emit()
 
     def _rename_asset(self, kind: str, item_id: str, new_name: str) -> None:
@@ -462,17 +475,18 @@ class LibraryIngestTab(QWidget):
             lib.update_note(item_id, new_name)
             lib.save()
             return
-        if kind in {"text", "link"}:
-            # 手工创建的 TextTemplate（文字 / 小程序链接）改名
+        if kind == "text":
             lib = VoiceLibrary.load(account_id=self._account_id)
             lib.update_text_template(item_id, name=new_name)
             lib.save()
             return
-        # image / video / oa：load → set name + 去 unnamed flag → save 覆盖
         module = {
             "image": image_tpl_mod,
             "video": video_tpl_mod,
             "oa": oa_tpl_mod,
+            "doc": oa_tpl_mod,
+            "channel": oa_tpl_mod,
+            "wxa": wxa_tpl_mod,
         }.get(kind)
         if module is None:
             raise ValueError(f"未知素材类型: {kind}")
@@ -489,35 +503,108 @@ class LibraryIngestTab(QWidget):
         finally:
             self._session_updating = False
 
+    def _captured_id_at(self, row: int) -> str:
+        item = self._captured_table.item(row, self._COL_NAME)
+        if item is None:
+            return ""
+        return str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+
+    def _captured_preview_payload(self, item_id: str) -> dict[str, Any]:
+        row = self._session_rows.get(item_id) or {}
+        kind = str(row.get("kind", "")).strip()
+        src = row.get("source") if isinstance(row.get("source"), dict) else {}
+        name = str(row.get("name", "")).strip() or "未命名"
+        payload: dict[str, Any] = {
+            "asset_type": kind,
+            "item_id": item_id,
+            "name": name,
+        }
+        if kind == "voice":
+            payload["path"] = str(src.get("dstPath") or src.get("file") or "")
+            payload["file"] = str(src.get("file") or "")
+        elif kind == "image":
+            payload["path"] = str(src.get("dstPath") or "")
+        elif kind == "video":
+            payload["path"] = str(src.get("dstPath") or "")
+            payload["thumb_path"] = str(src.get("thumbPath") or "")
+        elif kind in {"oa", "doc", "channel"}:
+            payload["oa_title"] = str(src.get("title") or "")
+            payload["oa_desc"] = str(src.get("desc") or "")
+            payload["oa_url"] = str(src.get("url") or "")
+            payload["oa_source"] = str(src.get("appname") or src.get("sourcename") or "")
+        elif kind == "wxa":
+            payload["wxa_title"] = str(src.get("title") or "")
+            payload["wxa_app"] = str(src.get("appName") or "")
+            payload["wxa_user"] = str(src.get("username") or "")
+        elif kind == "text":
+            preview = str(src.get("preview") or src.get("body") or row.get("extra") or "").strip()
+            payload["variants"] = [preview] if preview else []
+        return payload
+
+    def _open_captured_detail(self, row: int) -> None:
+        item_id = self._captured_id_at(row)
+        if not item_id or item_id not in self._session_rows:
+            return
+        payload = self._captured_preview_payload(item_id)
+        name = str(payload.get("name", "")).strip() or "未命名"
+        provider = self._preview_service_provider
+        if provider is None:
+            QMessageBox.information(
+                self,
+                "素材详情",
+                f"类型：{asset_type_to_zh(str(payload.get('asset_type', '')))}\n名称：{name}",
+            )
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"素材详情 · {name}")
+        dlg.resize(520, 560)
+        layout = QVBoxLayout(dlg)
+        panel = AssetPreviewPanel(preview_service_provider=provider)
+        panel.set_asset(payload)
+        layout.addWidget(panel, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dlg.reject)
+        close_btn = buttons.button(QDialogButtonBox.StandardButton.Close)
+        if close_btn is not None:
+            close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.exec()
+
     # ------------------------------------------------------------------
-    # 右键菜单：批量删除本轮已捕获（同步删底层素材库）
+    # 右键菜单：从本轮列表移除，不删素材库
     # ------------------------------------------------------------------
     def _on_captured_context_menu(self, pos) -> None:
         idx = self._captured_table.indexAt(pos)
         if not idx.isValid():
             return
+        prepare_context_selection(self._captured_table, idx)
         selected_ids = self._selected_captured_ids()
         if not selected_ids:
             return
         menu = QMenu(self)
-        act = menu.addAction(f"删除选中素材（{len(selected_ids)} 条）")
+        add_copy_action(menu, self._captured_table)
+        act_rename = menu.addAction("重命名")
+        act_detail = menu.addAction("查看详情")
+        delete_label = f"从本轮列表移除（{len(selected_ids)} 条）" if len(selected_ids) > 1 else "从本轮列表移除"
+        act_delete = menu.addAction(delete_label)
         chosen = menu.exec(self._captured_table.viewport().mapToGlobal(pos))
-        if chosen != act:
+        if chosen is None:
             return
-        if QMessageBox.question(
-            self,
-            "确认删除",
-            f"将从「已保存的素材」里彻底删除 {len(selected_ids)} 条素材，操作不可撤销。是否继续？",
-        ) != QMessageBox.StandardButton.Yes:
+        if chosen == act_detail:
+            self._open_captured_detail(idx.row())
             return
-        errors = self._delete_captured_items(selected_ids)
-        if errors:
-            logger.warning("删除部分素材失败 errors={}", errors)
-            QMessageBox.warning(
-                self, "部分素材删除失败",
-                "部分素材删除失败，请稍后重试。",
-            )
-        self.assetsChanged.emit()
+        if chosen == act_rename:
+            # 多选时重命名只改当前行
+            name_item = self._captured_table.item(idx.row(), self._COL_NAME)
+            if name_item is not None:
+                self._captured_table.editItem(name_item)
+            return
+        if chosen == act_delete:
+            # Step 4: 子模块删除——只从本轮列表移除，不删素材库
+            for tid in selected_ids:
+                self._session_rows.pop(tid, None)
+            self._render_session_panel()
+            return
 
     def _selected_captured_ids(self) -> list[str]:
         seen: set[str] = set()
@@ -532,6 +619,19 @@ class LibraryIngestTab(QWidget):
                 seen.add(tid)
                 out.append(tid)
         return out
+
+    def remove_items(self, deleted: list[tuple[str, str]]) -> None:
+        """Step 4: 主模块删除时，从本轮已捕获列表同步移除对应条目。"""
+        if not deleted:
+            return
+        deleted_ids = {str(row[1]).strip() for row in deleted if len(row) > 1 and str(row[1]).strip()}
+        changed = False
+        for tid in list(self._session_rows):
+            if tid in deleted_ids:
+                self._session_rows.pop(tid, None)
+                changed = True
+        if changed:
+            self._render_session_panel()
 
     def _delete_captured_items(self, item_ids: list[str]) -> list[str]:
         """按 kind 分派删除；返回失败信息列表。"""
@@ -562,7 +662,7 @@ class LibraryIngestTab(QWidget):
                     except Exception as exc:  # noqa: BLE001
                         errors.append(f"voice #{tid[:8]}: {exc}")
                 continue
-            if kind in {"text", "link"}:
+            if kind == "text":
                 for tid in ids:
                     try:
                         _lib().delete_text_template(tid)
@@ -574,6 +674,9 @@ class LibraryIngestTab(QWidget):
                 "image": image_tpl_mod,
                 "video": video_tpl_mod,
                 "oa": oa_tpl_mod,
+                "doc": oa_tpl_mod,
+                "channel": oa_tpl_mod,
+                "wxa": wxa_tpl_mod,
             }.get(kind)
             if module is None:
                 errors.append(f"未知类型 {kind}")
@@ -604,409 +707,3 @@ class LibraryIngestTab(QWidget):
         it = QTableWidgetItem(value)
         it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
         return it
-
-    # ==================================================================
-    # 手工创建：文字 / 小程序链接（F3.6）
-    # ------------------------------------------------------------------
-    # 本质都是 TextTemplate：text 走多变体 QTextEdit；link 走单条 URL 校验
-    # http/https。保存后直接 emit 到已捕获面板 + assetsChanged 让上层刷库。
-    # ==================================================================
-    def _build_text_group(self) -> QGroupBox:
-        box = QGroupBox("增加文字")
-        layout = QVBoxLayout(box)
-        self._text_name = QLineEdit()
-        self._text_name.setPlaceholderText("名字 *（用于素材库检索）")
-        self._text_variants = QTextEdit()
-        self._text_variants.setPlaceholderText("文字变体，每行 1 条；发送时随机抽 1 条")
-        self._text_variants.setAcceptRichText(False)
-        self._text_tags = QLineEdit()
-        self._text_tags.setPlaceholderText("标签（可选，顿号或逗号分隔）")
-        self._btn_save_text = QPushButton("保存文字")
-        self._btn_save_text.setEnabled(False)
-        layout.addWidget(self._text_name)
-        layout.addWidget(self._text_variants)
-        layout.addWidget(self._text_tags)
-        layout.addWidget(self._btn_save_text)
-
-        self._text_name.textChanged.connect(self._refresh_text_button_state)
-        self._text_variants.textChanged.connect(self._refresh_text_button_state)
-        self._btn_save_text.clicked.connect(self._save_text_material)
-        return box
-
-    def _build_link_group(self) -> QGroupBox:
-        box = QGroupBox("增加小程序链接")
-        layout = QVBoxLayout(box)
-        self._link_name = QLineEdit()
-        self._link_name.setPlaceholderText("名字 *（用于素材库检索）")
-        self._link_url = QLineEdit()
-        self._link_url.setPlaceholderText("URL *（http/https/自定义 scheme 均可）")
-        self._link_tags = QLineEdit()
-        self._link_tags.setPlaceholderText("标签（可选，顿号或逗号分隔）")
-        self._btn_save_link = QPushButton("保存小程序链接")
-        self._btn_save_link.setEnabled(False)
-        layout.addWidget(self._link_name)
-        layout.addWidget(self._link_url)
-        layout.addWidget(self._link_tags)
-        layout.addWidget(self._btn_save_link)
-        # 高度上和文字组视觉大致对齐（多的一行 spacer）
-        layout.addStretch(1)
-
-        self._link_name.textChanged.connect(self._refresh_link_button_state)
-        self._link_url.textChanged.connect(self._refresh_link_button_state)
-        self._btn_save_link.clicked.connect(self._save_link_material)
-        return box
-
-    def _build_variant_group(self) -> QGroupBox:
-        box = QGroupBox("增加文字变体")
-        layout = QVBoxLayout(box)
-        self._variant_pick = QComboBox()
-        self._variant_list = QListWidget()
-        self._variant_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._variant_list.customContextMenuRequested.connect(self._on_variant_list_context_menu)
-        self._variant_new_lines = QTextEdit()
-        self._variant_new_lines.setPlaceholderText("新变体，每行 1 条")
-        self._variant_new_lines.setAcceptRichText(False)
-        self._btn_append_variants = QPushButton("追加变体")
-        self._btn_append_variants.setEnabled(False)
-        layout.addWidget(self._variant_pick)
-        layout.addWidget(QLabel("已有变体（右键可删除）："))
-        layout.addWidget(self._variant_list)
-        layout.addWidget(self._variant_new_lines)
-        layout.addWidget(self._btn_append_variants)
-
-        self._variant_pick.currentIndexChanged.connect(self._on_variant_pick_changed)
-        self._variant_new_lines.textChanged.connect(self._refresh_variant_append_state)
-        self._btn_append_variants.clicked.connect(self._append_text_variants)
-        self._refresh_variant_picker()
-        return box
-
-    def _refresh_variant_picker(self) -> None:
-        current_id = self._current_variant_template_id()
-        self._variant_pick.blockSignals(True)
-        try:
-            self._variant_pick.clear()
-            try:
-                lib = VoiceLibrary.load(account_id=self._account_id)
-                rows = [
-                    tpl for tpl in lib.list_text_templates()
-                    if getattr(tpl, "kind", "text") == "text"
-                ]
-            except Exception:  # noqa: BLE001
-                rows = []
-            for tpl in rows:
-                label = f"{tpl.name}（{tpl.id[:8]}）"
-                self._variant_pick.addItem(label, tpl.id)
-            if current_id:
-                idx = self._variant_pick.findData(current_id)
-                if idx >= 0:
-                    self._variant_pick.setCurrentIndex(idx)
-        finally:
-            self._variant_pick.blockSignals(False)
-        self._on_variant_pick_changed(self._variant_pick.currentIndex())
-
-    def _current_variant_template_id(self) -> str:
-        data = self._variant_pick.currentData()
-        return str(data).strip() if isinstance(data, str) else ""
-
-    def _on_variant_pick_changed(self, _index: int) -> None:
-        template_id = self._current_variant_template_id()
-        variants: list[str] = []
-        if template_id:
-            try:
-                lib = VoiceLibrary.load(account_id=self._account_id)
-                template = lib.get_text_template(template_id)
-                variants = list(template.variants)
-            except Exception:  # noqa: BLE001
-                variants = []
-        self._render_variant_list(variants)
-        self._refresh_variant_append_state()
-
-    def _render_variant_list(self, variants: list[str]) -> None:
-        self._variant_updating = True
-        try:
-            self._variant_list.clear()
-            for text in variants:
-                item = QListWidgetItem(text)
-                self._variant_list.addItem(item)
-        finally:
-            self._variant_updating = False
-
-    def _refresh_variant_append_state(self) -> None:
-        has_template = bool(self._current_variant_template_id())
-        has_new = bool(self._split_variants(self._variant_new_lines.toPlainText()))
-        self._btn_append_variants.setEnabled(has_template and has_new)
-
-    def _persist_variant_list(self, template_id: str, variants: list[str]) -> bool:
-        try:
-            lib = VoiceLibrary.load(account_id=self._account_id)
-            lib.update_text_template(template_id, variants=variants)
-            lib.save()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("保存文字变体失败 template_id={} err={}", template_id, exc)
-            QMessageBox.warning(self, "保存变体失败", "保存失败，请稍后重试。")
-            return False
-        self._render_variant_list(variants)
-        self.assetsChanged.emit()
-        return True
-
-    def _append_text_variants(self) -> None:
-        template_id = self._current_variant_template_id()
-        if not template_id:
-            return
-        new_lines = self._split_variants(self._variant_new_lines.toPlainText())
-        if not new_lines:
-            return
-        try:
-            lib = VoiceLibrary.load(account_id=self._account_id)
-            template = lib.get_text_template(template_id)
-            merged = list(template.variants) + new_lines
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("读取文字素材失败 template_id={} err={}", template_id, exc)
-            QMessageBox.warning(self, "读取素材失败", "读取素材失败，请刷新后重试。")
-            return
-        if not self._persist_variant_list(template_id, merged):
-            return
-        self._variant_new_lines.clear()
-        self._refresh_variant_append_state()
-
-    def _on_variant_list_context_menu(self, pos) -> None:
-        item = self._variant_list.itemAt(pos)
-        if item is None:
-            return
-        template_id = self._current_variant_template_id()
-        if not template_id:
-            return
-        menu = QMenu(self)
-        act = menu.addAction("删除此变体")
-        chosen = menu.exec(self._variant_list.viewport().mapToGlobal(pos))
-        if chosen != act:
-            return
-        try:
-            lib = VoiceLibrary.load(account_id=self._account_id)
-            template = lib.get_text_template(template_id)
-            current = list(template.variants)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("读取文字素材失败 template_id={} err={}", template_id, exc)
-            QMessageBox.warning(self, "读取素材失败", "读取素材失败，请刷新后重试。")
-            return
-        row = self._variant_list.row(item)
-        if row < 0 or row >= len(current):
-            return
-        if len(current) <= 1:
-            QMessageBox.information(self, "无法删除", "文字素材至少需要保留 1 条变体。")
-            return
-        updated = current[:row] + current[row + 1 :]
-        self._persist_variant_list(template_id, updated)
-
-    def _refresh_text_button_state(self) -> None:
-        has_name = bool(self._text_name.text().strip())
-        has_body = bool(self._text_variants.toPlainText().strip())
-        self._btn_save_text.setEnabled(has_name and has_body)
-
-    def _refresh_link_button_state(self) -> None:
-        has_name = bool(self._link_name.text().strip())
-        has_url = bool(self._link_url.text().strip())
-        self._btn_save_link.setEnabled(has_name and has_url)
-
-    @staticmethod
-    def _split_tags(raw: str) -> list[str]:
-        cleaned = raw.replace("、", ",")
-        return [t.strip() for t in cleaned.split(",") if t.strip()]
-
-    @staticmethod
-    def _split_variants(raw: str) -> list[str]:
-        return [line.strip() for line in raw.splitlines() if line.strip()]
-
-    def _save_text_material(self) -> None:
-        name = self._text_name.text().strip()
-        variants = self._split_variants(self._text_variants.toPlainText())
-        tags = self._split_tags(self._text_tags.text())
-        if not name or not variants:
-            return
-        template_id = str(uuid.uuid4())
-        try:
-            lib = VoiceLibrary.load(account_id=self._account_id)
-            lib.add_text_template(
-                name=name, variants=variants, tags=tags,
-                template_id=template_id, kind="text",
-            )
-            lib.save()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("保存文字素材失败 account_id={} err={}", self._account_id, exc)
-            QMessageBox.warning(self, "保存文字失败", "保存失败，请稍后重试。")
-            return
-        self._append_captured_row("text", {"id": template_id, "preview": variants[0]}, name=name)
-        self._text_name.clear()
-        self._text_variants.clear()
-        self._text_tags.clear()
-        self._refresh_text_button_state()
-        self.assetsChanged.emit()
-
-    def _save_link_material(self) -> None:
-        name = self._link_name.text().strip()
-        url = self._link_url.text().strip()
-        tags = self._split_tags(self._link_tags.text())
-        if not name or not url:
-            return
-        # 放宽校验：链接内容用户自定，只要非空即可（支持自定义 scheme 如 weixin://、
-        # 小程序 URL scheme 等；发送侧当 text 直接下发文本）。
-        template_id = str(uuid.uuid4())
-        try:
-            lib = VoiceLibrary.load(account_id=self._account_id)
-            lib.add_link_template(name=name, url=url, tags=tags, template_id=template_id)
-            lib.save()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("保存小程序链接失败 account_id={} err={}", self._account_id, exc)
-            QMessageBox.warning(self, "保存小程序链接失败", "保存失败，请稍后重试。")
-            return
-        self._append_captured_row("link", {"id": template_id, "url": url}, name=name)
-        self._link_name.clear()
-        self._link_url.clear()
-        self._link_tags.clear()
-        self._refresh_link_button_state()
-        self.assetsChanged.emit()
-
-    # ==================================================================
-    # wxa 独立采集（legacy · 缺 mType 证据，本轮不合并）
-    # ==================================================================
-    def _toggle_wxa(self, checked: bool) -> None:
-        if checked:
-            if not self._start_wxa_process():
-                self._btn_wxa.setChecked(False)
-                return
-            self._btn_wxa.setText("关闭 wxa 采集")
-        else:
-            self._stop_wxa_process()
-            self._btn_wxa.setText("wxa 采集（legacy · 独立子进程）")
-
-    def _start_wxa_process(self) -> bool:
-        proc = self._wxa_process
-        if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
-            return True
-        proc = QProcess(self)
-        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        # frozen 下 sys.executable = exe，`-m` 会拉起新 GUI 实例；改走 __runmod__。
-        from app.bootstrap.frozen_dispatch import build_python_module_cmd
-
-        module_args = [
-            "--account-id", self._account_id,
-            "--fta-remote-id", self._FTA_REMOTE_ID,
-            "--timeout-seconds", "3600",
-        ]
-        if bool(getattr(sys, "frozen", False)):
-            full_cmd = build_python_module_cmd(
-                "runtime.wework_re_android.probe_fta_wxa_pipeline", *module_args
-            )
-            proc.setProgram(full_cmd[0])
-            proc.setArguments(full_cmd[1:])
-        else:
-            proc.setProgram(sys.executable)
-            proc.setArguments([
-                "-u", "-m", "runtime.wework_re_android.probe_fta_wxa_pipeline",
-                *module_args,
-            ])
-        proc.setWorkingDirectory(str(resolve_path(Path("."))))
-        proc.finished.connect(lambda _c, _s: self._on_wxa_finished())
-        proc.errorOccurred.connect(lambda _e: self._on_wxa_finished())
-        proc.readyReadStandardOutput.connect(proc.readAllStandardOutput)
-        proc.start()
-        if not proc.waitForStarted(3000):
-            QMessageBox.warning(self, "wxa 采集启动失败", "子进程未能在 3s 内启动。")
-            return False
-        self._wxa_process = proc
-        return True
-
-    def _stop_wxa_process(self) -> None:
-        proc = self._wxa_process
-        if proc is None:
-            return
-        if proc.state() != QProcess.ProcessState.NotRunning:
-            proc.terminate()
-            if not proc.waitForFinished(3000):
-                proc.kill()
-                proc.waitForFinished(1000)
-        self._wxa_process = None
-
-    def _on_wxa_finished(self) -> None:
-        self._wxa_process = None
-        self._btn_wxa.setChecked(False)
-        self._btn_wxa.setText("wxa 采集（legacy · 独立子进程）")
-
-    # ==================================================================
-    # Pending 轮询（wxa + 历史遗留 pending 文件）
-    # ==================================================================
-    def _poll_pending_templates(self) -> None:
-        if self._pending_dialog_open:
-            return
-        pending: list[tuple[str, Path]] = []
-        try:
-            for p in oa_tpl_mod.list_pending(self._account_id):
-                pending.append(("oa", p))
-            for p in wxa_tpl_mod.list_pending(self._account_id):
-                pending.append(("wxa", p))
-            for p in image_tpl_mod.list_pending(self._account_id):
-                pending.append(("image", p))
-            for p in video_tpl_mod.list_pending(self._account_id):
-                pending.append(("video", p))
-        except Exception:
-            return
-        alive = {str(p) for _, p in pending}
-        self._pending_seen &= alive
-        for kind, path in pending:
-            key = str(path)
-            if key in self._pending_seen:
-                continue
-            self._show_pending_dialog(kind, path)
-            return
-        self.unnamedCountChanged.emit(self._read_unnamed_count())
-
-    def _show_pending_dialog(self, kind: str, path: Path) -> None:
-        module = {
-            "oa": oa_tpl_mod,
-            "wxa": wxa_tpl_mod,
-            "image": image_tpl_mod,
-            "video": video_tpl_mod,
-        }[kind]
-        payload = PendingTemplateDialog.load_payload(path)
-        if not payload:
-            module.discard_pending(path)
-            return
-        self._pending_dialog_open = True
-        dlg = PendingTemplateDialog(path, payload, kind=kind, parent=self)
-        try:
-            dlg.exec()
-            decision = dlg.decision()
-            if decision == PendingTemplateDialog.RESULT_SAVE:
-                try:
-                    module.commit_pending(
-                        path, name=dlg.entered_name(), tags=dlg.entered_tags(), account_id=self._account_id
-                    )
-                    self.assetsChanged.emit()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("提交 pending 素材失败 kind={} path={} err={}", kind, path, exc)
-                    QMessageBox.warning(self, "保存失败", "保存失败，请稍后重试。")
-            elif decision == PendingTemplateDialog.RESULT_DISCARD:
-                module.discard_pending(path)
-            else:
-                self._pending_seen.add(str(path))
-        finally:
-            self._pending_dialog_open = False
-            self.unnamedCountChanged.emit(self._read_unnamed_count())
-
-    def _read_unnamed_count(self) -> int:
-        count = 0
-        try:
-            lib = VoiceLibrary.load(account_id=self._account_id)
-            count += sum(1 for row in lib.list() if not row.note.strip() and not row.label.strip())
-        except Exception:
-            pass
-        # image/video/oa：payload["unnamed"] == True 计入
-        for mod in (image_tpl_mod, video_tpl_mod, oa_tpl_mod):
-            try:
-                for fp in mod.list_templates(self._account_id):
-                    payload = mod.load_template(str(fp), account_id=self._account_id)
-                    if bool(payload.get("unnamed")):
-                        count += 1
-            except Exception:
-                continue
-        return count

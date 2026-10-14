@@ -13,6 +13,9 @@ APScheduler>=3.10.4
 # Android MuMu / Frida 运行时（send_engine、探针、会话枚举）
 frida==16.7.19
 
+# 素材库 DPAPI 加密（采集落盘、读取已保存素材）
+pywin32>=306
+
 # 打包 (Stage 5.5 · 可选; 只在需要 build exe 时安装)
 # 直接 `pip install pyinstaller>=6.3.0`, 或取消下面这行注释
 # pyinstaller>=6.3.0
@@ -21,4 +24,3 @@ frida==16.7.19
 # pycaw>=20240210       # 麦克风切换 (仅当希望自动切默认输入设备)
 # pandas>=2.2.0         # CSV/Excel
 # mss>=9.0.1            # 失败截图
-# pywin32>=306          # 前置窗口/锁鼠键

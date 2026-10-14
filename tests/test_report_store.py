@@ -32,8 +32,8 @@ def test_load_report_and_resume_cursor(tmp_path):
     )
     view = store.load_report(run_uuid)
     assert len(view.rows) == 2
-    assert view.last_completed_step_index() == 0
-    assert view.next_resume_step_index() == 1
+    assert view.last_completed_step_index() == 1
+    assert view.next_resume_step_index() == 2
 
 
 def test_export_csv_and_gc(tmp_path):
@@ -85,3 +85,39 @@ def test_delete_reports_remove_jsonl_and_csv(tmp_path):
     assert not store.report_path(run_del).exists()
     assert not csv_del.exists()
     assert store.report_path(run_keep).exists()
+
+
+def test_load_report_normalizes_legacy_rows(tmp_path):
+    store = ReportStore(reports_dir=tmp_path / "reports")
+    store.append(
+        "legacy",
+        {"type": "plan_meta", "ts": "2026-10-12T08:30:00", "plan": {"name": "旧计划"}},
+    )
+    store.append("legacy", {"step_index": 0, "status": "sent"})
+
+    rows = store.load_report("legacy").rows
+
+    assert rows[0]["started_at"] == "2026-10-12T08:30:00"
+    assert rows[0]["name"] == "旧计划"
+    assert rows[1]["inner_index"] == -1
+
+
+def test_rename_plan_updates_saved_name(tmp_path):
+    store = ReportStore(reports_dir=tmp_path / "reports")
+    store.append(
+        "run-1",
+        {
+            "type": "plan_meta",
+            "plan": {"name": "（立即执行）2026-10-13 10:00:00", "contacts": [], "sequence": []},
+            "name": "（立即执行）2026-10-13 10:00:00",
+            "started_at": "2026-10-13T10:00:00",
+        },
+    )
+    store.append("run-1", {"step_index": 0, "status": "sent", "type": "text"})
+
+    assert store.rename_plan("run-1", "周一回访")
+
+    rows = store.load_report("run-1").rows
+    assert rows[0]["name"] == "周一回访"
+    assert rows[0]["plan"]["name"] == "周一回访"
+    assert rows[1]["status"] == "sent"

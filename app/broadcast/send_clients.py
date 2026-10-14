@@ -17,10 +17,19 @@ class DryRunClient:
     def send_text(self, *, conv_local: str, body: str) -> bool:
         return True
 
+    def send_at(self, *, conv_local: str, body: str) -> bool:
+        return True
+
+    def send_notice(self, *, conv_local: str, body: str) -> bool:
+        return True
+
     def send_image(self, *, conv_local: str, image_path: str) -> bool:
         return True
 
     def send_oa(self, *, conv_local: str, template: str) -> bool:
+        return True
+
+    def send_wxa(self, *, conv_local: str, template: str) -> bool:
         return True
 
     def send_video(

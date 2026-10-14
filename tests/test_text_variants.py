@@ -26,6 +26,9 @@ class _TextOnlySendClient:
     def send_oa(self, *, conv_local: str, template: str) -> bool:
         raise AssertionError("本测试不应发送公众号卡片")
 
+    def send_wxa(self, *, conv_local: str, template: str) -> bool:
+        raise AssertionError("本测试不应发送小程序")
+
     def send_video(
         self,
         *,

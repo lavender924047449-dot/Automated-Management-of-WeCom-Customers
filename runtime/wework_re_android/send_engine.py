@@ -1,11 +1,14 @@
 """
-Step 3/9: 统一发送引擎 (voice / text / image / oa / video)。
+Step 3/9: 统一发送引擎 (voice / text / image / oa / video / wxa / at / notice)。
 
 CLI:
   python -m runtime.wework_re_android.send_engine voice --conv-local ... --silk-path ... --voice-time 3
   python -m runtime.wework_re_android.send_engine text  --conv-local ... --body "你好"
+  python -m runtime.wework_re_android.send_engine at    --conv-local ... --body "你好"
+  python -m runtime.wework_re_android.send_engine notice --conv-local ... --body "公告正文"
   python -m runtime.wework_re_android.send_engine image --conv-local ... --image-path /sdcard/...
   python -m runtime.wework_re_android.send_engine oa    --conv-local ... --template <id-or-json-path>
+  python -m runtime.wework_re_android.send_engine wxa   --conv-local ... --template <id-or-json-path>
   python -m runtime.wework_re_android.send_engine video --conv-local ... --video-path /sdcard/a.mp4 [--thumb-path /sdcard/a.jpg] [--duration 8]
 """
 
@@ -17,11 +20,17 @@ import os
 import subprocess
 import sys
 import time
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 
+from app.bootstrap.win_subprocess import install_global_no_window_patch
 from app.broadcast.account import resolve_account_id
 from app.broadcast.oa_templates import load_template
 from runtime.wework_re_android.frida_session import FridaSession
+
+# 每条消息都会新开一个发送进程，里面多次调用 adb.exe。
+# 父界面的无窗口补丁不会带进子进程，这里一导入就装上，避免执行时黑框频闪。
+install_global_no_window_patch()
 
 
 DEFAULT_ADB_SERIAL = "127.0.0.1:16384"
@@ -44,7 +53,7 @@ def _escape_js_str(s: str) -> str:
 
 def build_js(
     *,
-    action: Literal["voice", "text", "image", "oa", "video"],
+    action: Literal["voice", "text", "image", "oa", "video", "wxa", "at", "notice"],
     conv_local: str,
     silk_path: str = "",
     voice_time: int = 0,
@@ -54,6 +63,7 @@ def build_js(
     thumb_path: str = "",
     duration: int = 0,
     oa_template_json: str = "",
+    wxa_template_json: str = "",
     activity_guard: str = "",
 ) -> str:
     return (
@@ -68,13 +78,18 @@ Java.perform(function () {
         var FileOutputStream = Java.use('java.io.FileOutputStream');
         var MapCls = Java.use('java.util.Map');
         var JString = Java.use('java.lang.String');
+        var AT_NOTICE_KEEP = [];
         var Base64 = Java.use('android.util.Base64');
         var BitmapFactory = Java.use('android.graphics.BitmapFactory');
         var BitmapOptions = Java.use('android.graphics.BitmapFactory$Options');
         var BitmapCompressFormat = Java.use('android.graphics.Bitmap$CompressFormat');
         var MediaMetadataRetriever = Java.use('android.media.MediaMetadataRetriever');
 
-        var convId = new Int64('__CONV_LOCAL__');
+        var convRaw = '__CONV_LOCAL__';
+        var convId = null;
+        if (convRaw.indexOf('friend:') !== 0) {
+            convId = new Int64(convRaw);
+        }
         var action = '__ACTION__';
 
         function getForegroundActivity() {
@@ -85,18 +100,29 @@ Java.perform(function () {
             var acts = mActivitiesField.get(at);
             var actsMap = Java.cast(acts, MapCls);
             var values = actsMap.values().toArray();
+            var fallback = null;
             for (var i = 0; i < values.length; i++) {
                 var rec = values[i];
                 var recCls = rec.getClass();
                 var pausedField = recCls.getDeclaredField('paused');
                 pausedField.setAccessible(true);
-                if (!pausedField.getBoolean(rec)) {
-                    var actField = recCls.getDeclaredField('activity');
-                    actField.setAccessible(true);
-                    return actField.get(rec);
+                var paused = pausedField.getBoolean(rec);
+                var stopped = false;
+                try {
+                    var stoppedField = recCls.getDeclaredField('stopped');
+                    stoppedField.setAccessible(true);
+                    stopped = stoppedField.getBoolean(rec);
+                } catch (_) {}
+                var actField = recCls.getDeclaredField('activity');
+                actField.setAccessible(true);
+                var act = actField.get(rec);
+                if (!act) continue;
+                if (!fallback || String(act.getClass().getName()).indexOf('WwMainActivity') >= 0) {
+                    fallback = act;
                 }
+                if (!paused && !stopped) return act;
             }
-            return null;
+            return fallback;
         }
 
         function validateFile(path, label) {
@@ -218,6 +244,121 @@ Java.perform(function () {
             return null;
         }
 
+        function atNoticeSetInt(obj, name, n) {
+            var f = obj.getClass().getDeclaredField(name);
+            f.setAccessible(true);
+            f.setInt(obj, n);
+        }
+
+        function atNoticeSetObj(obj, name, value) {
+            obj[name].value = value;
+        }
+
+        function atNoticeTextPart(body) {
+            var Text = Java.use('com.tencent.wework.foundation.model.pb.WwRichmessage$TextMessage');
+            var Part = Java.use('com.tencent.wework.foundation.model.pb.WwRichmessageBase$Message');
+            var Nano = Java.use('com.google.protobuf.nano.MessageNano');
+            var text = Text.$new();
+            atNoticeSetObj(text, 'content', JString.$new(body).getBytes('UTF-8'));
+            var part = Part.$new();
+            atNoticeSetInt(part, 'contentType', 0);
+            atNoticeSetObj(part, 'data', Nano.toByteArray(text));
+            return part;
+        }
+
+        function atNoticeAtAllPart() {
+            var At = Java.use('com.tencent.wework.foundation.model.pb.WwRichmessage$AtMessage');
+            var Part = Java.use('com.tencent.wework.foundation.model.pb.WwRichmessageBase$Message');
+            var Nano = Java.use('com.google.protobuf.nano.MessageNano');
+            var at = At.$new();
+            atNoticeSetObj(at, 'name', JString.$new('\u6240\u6709\u4eba ').getBytes('UTF-8'));
+            var part = Part.$new();
+            atNoticeSetInt(part, 'contentType', 5);
+            atNoticeSetObj(part, 'data', Nano.toByteArray(at));
+            return part;
+        }
+
+        function atNoticeRich(parts) {
+            var Rich = Java.use('com.tencent.wework.foundation.model.pb.WwRichmessageBase$RichMessage');
+            var rich = Rich.$new();
+            atNoticeSetObj(
+                rich,
+                'messages',
+                Java.array('com.tencent.wework.foundation.model.pb.WwRichmessageBase$Message', parts)
+            );
+            return rich;
+        }
+
+        function sendAtOrNotice(which, convLocal, body) {
+            var conv = findConversationByLocal(convLocal);
+            if (!conv) {
+                console.log('[send_engine] action=' + which + ' error=conversation not found');
+                console.log('[send_engine] action=' + which + ' return=false');
+                return;
+            }
+            var typeMatch = /type:\s*(\d+)/.exec(String(conv));
+            var convType = typeMatch ? parseInt(typeMatch[1], 10) : -1;
+            if (convType !== 1) {
+                console.log('[send_engine] action=' + which + ' error=not a group type=' + convType);
+                console.log('[send_engine] action=' + which + ' return=false');
+                return;
+            }
+            var textBody = String(body || '');
+            if (!textBody.trim()) {
+                console.log('[send_engine] action=' + which + ' error=empty body');
+                console.log('[send_engine] action=' + which + ' return=false');
+                return;
+            }
+            var CS = Java.use('com.tencent.wework.foundation.logic.ConversationService');
+            var svc = CS.getService();
+            if (which === 'notice') {
+                var NoticeCb = Java.registerClass({
+                    name: 'com.testvoice.EngineNoticeCb' + Date.now(),
+                    implements: [Java.use('com.tencent.wework.foundation.callback.IConversationOperateCallback2')],
+                    methods: {
+                        onResult: function (code, text, convBack) {
+                            var ok = parseInt(String(code), 10) === 0;
+                            console.log('[send_engine] action=notice code=' + code + ' text=' + text);
+                            console.log('[send_engine] action=notice return=' + ok);
+                        }
+                    }
+                });
+                var noticeCb = NoticeCb.$new();
+                AT_NOTICE_KEEP.push(noticeCb);
+                svc.SetGroupNotification(conv, atNoticeRich([atNoticeTextPart(textBody)]), true, noticeCb);
+                console.log('[send_engine] action=notice dispatched');
+                return;
+            }
+            var SendCb = Java.registerClass({
+                name: 'com.testvoice.EngineAtCb' + Date.now(),
+                implements: [Java.use('com.tencent.wework.foundation.callback.ISendMessageCallback')],
+                methods: {
+                    onProgress: function () {},
+                    onResult: function (code, convBack, message) {
+                        var ok = parseInt(String(code), 10) === 0;
+                        console.log('[send_engine] action=at code=' + code);
+                        console.log('[send_engine] action=at return=' + ok);
+                    }
+                }
+            });
+            var sendCb = SendCb.$new();
+            AT_NOTICE_KEEP.push(sendCb);
+            var Nano = Java.use('com.google.protobuf.nano.MessageNano');
+            var WwMsg = Java.use('com.tencent.wework.foundation.model.pb.WwMessage$Message');
+            var Message = Java.use('com.tencent.wework.foundation.model.Message');
+            var info = WwMsg.$new();
+            atNoticeSetInt(info, 'contentType', 0);
+            atNoticeSetObj(info, 'content', Nano.toByteArray(atNoticeRich([atNoticeAtAllPart(), atNoticeTextPart(textBody)])));
+            var msg = Message.NewMessage();
+            msg.setInfo(info);
+            svc.SendMessage.overload(
+                'com.tencent.wework.foundation.model.Conversation',
+                'com.tencent.wework.foundation.model.Message',
+                'com.tencent.wework.foundation.callback.ISendMessageCallback'
+            ).call(svc, conv, msg, sendCb);
+            console.log('[send_engine] action=at dispatched');
+        }
+
         function firstNonEmpty(arr, fallback) {
             for (var i = 0; i < arr.length; i++) {
                 var v = arr[i];
@@ -260,8 +401,35 @@ Java.perform(function () {
                 console.log('[send_engine] oa template missing linkUrl');
                 return null;
             }
-            var emptyBytes = Java.array('byte', []);
-            var linkMsg = h8y.f2(linkUrl, title, desc, imageUrl, emptyBytes);
+
+            // Step 3: 下载封面图字节，传入 h8y.f2 第 5 参
+            var imgBytes = Java.array('byte', []);
+            if (imageUrl && (imageUrl.indexOf('http://') === 0 || imageUrl.indexOf('https://') === 0)) {
+                try {
+                    var URL = Java.use('java.net.URL');
+                    var ByteArrayOutputStream = Java.use('java.io.ByteArrayOutputStream');
+                    var conn = URL.$new(imageUrl).openConnection();
+                    conn.setConnectTimeout(5000);
+                    conn.setReadTimeout(5000);
+                    conn.connect();
+                    var is = conn.getInputStream();
+                    var baos = ByteArrayOutputStream.$new();
+                    var buf = Java.array('byte', Array(4096).fill(0));
+                    while (true) {
+                        var n = is.read(buf);
+                        if (n <= 0) break;
+                        baos.write(buf, 0, n);
+                    }
+                    is.close();
+                    imgBytes = baos.toByteArray();
+                    console.log('[send_engine] oa thumb downloaded, size=' + imgBytes.length);
+                } catch (eDl) {
+                    console.log('[send_engine] oa thumb download failed: ' + eDl);
+                    imgBytes = Java.array('byte', []);
+                }
+            }
+
+            var linkMsg = h8y.f2(linkUrl, title, desc, imageUrl, imgBytes);
             if (!linkMsg) {
                 console.log('[send_engine] h8y.f2 returned null');
                 return null;
@@ -273,6 +441,196 @@ Java.perform(function () {
                 return null;
             }
             return { message: message, msgType: msgType };
+        }
+
+        function javaBytesFromB64(b64) {
+            return Base64.decode(JString.$new(String(b64)), 0);
+        }
+
+        function varintList(n) {
+            var out = [];
+            var v = n;
+            if (!(v >= 0)) v = 0;
+            while (v > 127) {
+                out.push((v & 127) | 128);
+                v = Math.floor(v / 128);
+            }
+            out.push(v & 127);
+            return out;
+        }
+
+        function signedByte(n) {
+            var v = n & 255;
+            return v > 127 ? v - 256 : v;
+        }
+
+        function listToJavaBytes(list) {
+            var out = Java.array('byte', Array(list.length).fill(0));
+            for (var i = 0; i < list.length; i++) out[i] = signedByte(list[i]);
+            return out;
+        }
+
+        function concatJavaBytes(parts) {
+            var System = Java.use('java.lang.System');
+            var total = 0;
+            for (var i = 0; i < parts.length; i++) total += parts[i].length;
+            var out = Java.array('byte', Array(total).fill(0));
+            var off = 0;
+            for (var i = 0; i < parts.length; i++) {
+                System.arraycopy(parts[i], 0, out, off, parts[i].length);
+                off += parts[i].length;
+            }
+            return out;
+        }
+
+        function protoKey(fieldNum, wireType) {
+            return varintList((fieldNum << 3) | wireType);
+        }
+
+        function wrapLenField(fieldNum, payload) {
+            var head = protoKey(fieldNum, 2).concat(varintList(payload.length));
+            return concatJavaBytes([listToJavaBytes(head), payload]);
+        }
+
+        function setDeclared(obj, name, jsValue) {
+            if (!obj || jsValue === null || jsValue === undefined || jsValue === '') return false;
+            try {
+                var f = obj.getClass().getDeclaredField(name);
+                f.setAccessible(true);
+                var t = String(f.getType().getName());
+                if (t === 'java.lang.String') {
+                    f.set(obj, JString.$new(String(jsValue)));
+                } else if (t === '[B') {
+                    f.set(obj, JString.$new(String(jsValue)).getBytes('UTF-8'));
+                } else if (t === 'int') {
+                    f.setInt(obj, parseInt(jsValue, 10));
+                } else if (t === 'java.lang.Integer') {
+                    f.set(obj, Java.use('java.lang.Integer').valueOf(parseInt(jsValue, 10)));
+                } else {
+                    return false;
+                }
+                return true;
+            } catch (_) {
+                return false;
+            }
+        }
+
+        function buildWxaMessage(rawJson) {
+            var tpl = {};
+            try {
+                tpl = JSON.parse(rawJson);
+            } catch (eParse) {
+                console.log('[send_engine] invalid wxa template json: ' + eParse);
+                return null;
+            }
+            var WeApp = Java.use('com.tencent.wework.foundation.model.pb.WeAppMessageProto$WeAppMessage');
+            var app = null;
+            if (tpl.weappBodyB64) {
+                try {
+                    var body = javaBytesFromB64(String(tpl.weappBodyB64));
+                    app = WeApp.parseFrom.overload('[B').call(WeApp, body);
+                    console.log('[send_engine] wxa parseFrom body=' + body.length);
+                } catch (eParseFrom) {
+                    console.log('[send_engine] wxa parseFrom failed: ' + eParseFrom);
+                    app = null;
+                }
+            }
+            if (!app) {
+                try {
+                    app = WeApp.$new();
+                } catch (eNew) {
+                    console.log('[send_engine] wxa WeAppMessage.$new failed: ' + eNew);
+                    return null;
+                }
+            }
+            var names = ['username', 'pagepath', 'title', 'appName', 'weappIconUrl', 'desc'];
+            for (var ni = 0; ni < names.length; ni++) {
+                if (tpl[names[ni]]) setDeclared(app, names[ni], tpl[names[ni]]);
+            }
+            if (tpl.type !== undefined && tpl.type !== null && tpl.type !== '') {
+                setDeclared(app, 'type', tpl.type);
+            }
+            var MN = Java.use('com.google.protobuf.nano.MessageNano');
+            var toBytes = MN.toByteArray.overload('com.google.protobuf.nano.MessageNano');
+            var appBytes = toBytes.call(MN, app);
+            console.log('[send_engine] wxa appBytes=' + appBytes.length);
+            if (!appBytes || appBytes.length < 8) {
+                console.log('[send_engine] wxa app bytes too short');
+                return null;
+            }
+            var wrapped = wrapLenField(107, appBytes);
+            var contentTypeKey = listToJavaBytes(protoKey(7, 0).concat(varintList(78)));
+            var outer = concatJavaBytes([contentTypeKey, wrapLenField(10, wrapped)]);
+            var Info = Java.use('com.tencent.wework.foundation.model.pb.WwMessage$Message');
+            var info = null;
+            try {
+                info = Info.parseFrom.overload('[B').call(Info, outer);
+            } catch (eInfo) {
+                console.log('[send_engine] wxa message parseFrom failed: ' + eInfo);
+                return null;
+            }
+            var back = toBytes.call(MN, info);
+            var ctype = '?';
+            try {
+                ctype = String(info.contentType.value);
+            } catch (_) {
+                try { ctype = String(info.contentType); } catch (_2) {}
+            }
+            console.log('[send_engine] wxa wire=' + outer.length + ' roundtrip=' + back.length + ' contentType=' + ctype);
+            if (back.length < Math.floor(outer.length / 2)) {
+                try {
+                    info = Info.$new();
+                    setDeclared(info, 'contentType', 78);
+                    var contentField = info.getClass().getDeclaredField('content');
+                    contentField.setAccessible(true);
+                    contentField.set(info, wrapped);
+                    back = toBytes.call(MN, info);
+                    console.log('[send_engine] wxa content-field roundtrip=' + back.length);
+                } catch (eContent) {
+                    console.log('[send_engine] wxa content-field fallback failed: ' + eContent);
+                }
+            }
+            var Msg = Java.use('com.tencent.wework.foundation.model.Message');
+            var message = null;
+            var newErr = '';
+            try {
+                message = Msg.NewMessage.overload('com.tencent.wework.foundation.model.pb.WwMessage$Message').call(Msg, info);
+            } catch (eNmInfo) {
+                newErr = String(eNmInfo);
+            }
+            if (!message) {
+                try {
+                    message = Msg.NewMessage();
+                } catch (eNm) {
+                    newErr = newErr + ' | ' + eNm;
+                }
+            }
+            if (!message) {
+                try {
+                    message = Msg.NewMessage.overload().call(Msg);
+                } catch (eNm2) {
+                    newErr = newErr + ' | ' + eNm2;
+                }
+            }
+            if (!message) {
+                console.log('[send_engine] wxa NewMessage failed: ' + newErr);
+                return null;
+            }
+            try {
+                if (message.getInfo) {
+                    var cur = message.getInfo();
+                    var same = cur && String(cur) === String(info);
+                    if (!same) {
+                        message.setInfo.overload('com.tencent.wework.foundation.model.pb.WwMessage$Message').call(message, info);
+                    }
+                } else {
+                    message.setInfo.overload('com.tencent.wework.foundation.model.pb.WwMessage$Message').call(message, info);
+                }
+            } catch (eSetInfo) {
+                console.log('[send_engine] wxa setInfo failed: ' + eSetInfo);
+                return null;
+            }
+            return message;
         }
 
         function setFieldIfPresent(obj, fieldName, value) {
@@ -324,9 +682,109 @@ Java.perform(function () {
             return;
         }
 
+        function findCachedUser(remoteId) {
+            var contacts = Java.use('com.tencent.wework.foundation.logic.ContactService').getService();
+            var arr = contacts.GetCachedContactList();
+            var n = arr ? arr.length : 0;
+            for (var i = 0; i < n; i++) {
+                var u = arr[i];
+                if (!u) continue;
+                try {
+                    if (String(u.getRemoteId()) === String(remoteId)) return u;
+                } catch (eUser) {}
+            }
+            return null;
+        }
+
+        function publishConversation(conv, api) {
+            var svc = Java.use('com.tencent.wework.foundation.logic.ConversationService').getService();
+            var info = conv.getInfo();
+            var hidden = info.getClass().getDeclaredField('hidden');
+            hidden.setAccessible(true);
+            hidden.set(info, Java.use('java.lang.Boolean').valueOf(false));
+            conv.setInfo(info);
+            svc.SaveConversation(conv);
+            if (api) {
+                var convArr = Java.array('com.tencent.wework.foundation.model.Conversation', [conv]);
+                api.updateConversationCache.overload(
+                    '[Lcom.tencent.wework.foundation.model.Conversation;',
+                    'boolean'
+                ).call(api, convArr, true);
+            }
+            var idField = conv.getInfo().getClass().getDeclaredField('id');
+            idField.setAccessible(true);
+            return new Int64(String(idField.get(conv.getInfo())));
+        }
+
+        function createSingleConversation(user, api) {
+            var holder = {id: null, err: ''};
+            var CB = Java.registerClass({
+                name: 'com.cursor.EnsureConv' + Date.now(),
+                implements: [Java.use('com.tencent.wework.foundation.callback.ICommonConversationOperateCallback')],
+                methods: {
+                    onResult: function (code, conv, errMsg) {
+                        if (!conv || code !== 0) {
+                            holder.err = String(code) + ' ' + (errMsg ? String(errMsg) : '');
+                            return;
+                        }
+                        try {
+                            holder.id = publishConversation(conv, api);
+                        } catch (ePub) {
+                            holder.err = String(ePub);
+                        }
+                    }
+                }
+            });
+            var svc = Java.use('com.tencent.wework.foundation.logic.ConversationService').getService();
+            var users = Java.array('com.tencent.wework.foundation.model.User', [user]);
+            svc.CreateConversation.overload(
+                'java.lang.String',
+                '[Lcom.tencent.wework.foundation.model.User;',
+                'com.tencent.wework.foundation.model.Conversation',
+                'com.tencent.wework.foundation.callback.ICommonConversationOperateCallback'
+            ).call(svc, '', users, null, CB.$new());
+            if (!holder.id) console.log('[send_engine] create conversation failed: ' + holder.err);
+            return holder.id;
+        }
+
+        function resolveSendableConv(api, currentId) {
+            if (api && currentId) {
+                try {
+                    var existing = api.getConversationItem.overload('long').call(api, currentId);
+                    if (existing) return currentId;
+                } catch (eItem) {
+                    console.log('[send_engine] getConversationItem failed: ' + eItem);
+                }
+            }
+            var remote = '';
+            if (convRaw.indexOf('friend:') === 0) remote = convRaw.substring('friend:'.length);
+            else if (convRaw.indexOf('788') === 0) remote = convRaw;
+            if (!remote) {
+                console.log('[send_engine] session item missing for conv=' + convRaw);
+                return currentId;
+            }
+            var user = findCachedUser(remote);
+            if (!user) {
+                console.log('[send_engine] cached contact missing remote=' + remote);
+                return null;
+            }
+            var created = createSingleConversation(user, api);
+            if (created) console.log('[send_engine] conversation ready local=' + created);
+            return created;
+        }
+
+        var convApi = null;
+        Java.choose('com.tencent.wework.msg.temp.ConversationApiImpl', {
+            onMatch: function (inst) { if (!convApi) convApi = inst; },
+            onComplete: function () {
         Java.scheduleOnMainThread(function () {
             try {
                 var ok = false;
+                convId = resolveSendableConv(convApi, convId);
+                if (!convId) {
+                    console.log('[send_engine] abort: conversation not ready');
+                    return;
+                }
                 if (action === 'voice') {
                     var silkPath = '__SILK_PATH__';
                     if (!validateFile(silkPath, 'silk')) return;
@@ -430,6 +888,36 @@ Java.perform(function () {
                     );
                     sendOa.call(h8y, activity, convObj, built.message, null, null);
                     ok = true;
+                } else if (action === 'wxa') {
+                    var wxaActivity = activity;
+                    var wxaConvId = String(convId);
+                    Java.scheduleOnMainThread(function () {
+                        try {
+                            console.log('[send_engine] wxa begin');
+                            var wxaMsg = buildWxaMessage('__WXA_TEMPLATE_JSON__');
+                            if (!wxaMsg) {
+                                console.log('[send_engine] action=wxa error=template build failed');
+                                return;
+                            }
+                            var convObjW = findConversationByLocal(wxaConvId);
+                            if (!convObjW) {
+                                console.log('[send_engine] action=wxa error=conversation not found');
+                                return;
+                            }
+                            var sendWxa = h8y.s8.overload(
+                                'android.content.Context',
+                                'com.tencent.wework.foundation.model.Conversation',
+                                'com.tencent.wework.foundation.model.Message',
+                                'zi90',
+                                'com.tencent.wework.foundation.callback.ISendMessageCallback'
+                            );
+                            sendWxa.call(h8y, wxaActivity, convObjW, wxaMsg, null, null);
+                            console.log('[send_engine] action=wxa return=true');
+                        } catch (eWxa) {
+                            console.log('[send_engine] action=wxa error=' + eWxa);
+                        }
+                    });
+                    return;
                 } else if (action === 'video') {
                     var videoPath = '__VIDEO_PATH__';
                     var thumbPath = '__THUMB_PATH__';
@@ -550,6 +1038,9 @@ Java.perform(function () {
                         ok = q8Video.call(h8y.X4(), activity, convId, fmVideo, 23, null, null);
                         console.log('[send_engine] action=video path=q8_fallback');
                     }
+                } else if (action === 'at' || action === 'notice') {
+                    sendAtOrNotice(action, String(convId), '__BODY__');
+                    return;
                 } else {
                     console.log('[send_engine] unknown action=' + action);
                     return;
@@ -559,13 +1050,15 @@ Java.perform(function () {
                 console.log('[send_engine] action=' + action + ' error=' + eSend);
             }
         });
+            }
+        });
     } catch (e) {
         console.log('[send_engine] init error=' + e);
     }
 });
 """
         .replace("__ACTION__", action)
-        .replace("__CONV_LOCAL__", conv_local)
+        .replace("__CONV_LOCAL__", _escape_js_str(conv_local))
         .replace("__SILK_PATH__", _escape_js_str(silk_path))
         .replace("__VOICE_TIME__", str(int(voice_time)))
         .replace("__BODY__", _escape_js_str(body))
@@ -574,6 +1067,7 @@ Java.perform(function () {
         .replace("__THUMB_PATH__", _escape_js_str(thumb_path))
         .replace("__DURATION__", str(int(duration)))
         .replace("__OA_TEMPLATE_JSON__", _escape_js_str(oa_template_json))
+        .replace("__WXA_TEMPLATE_JSON__", _escape_js_str(wxa_template_json))
         .replace("__ACTIVITY_GUARD__", _escape_js_str(activity_guard))
     )
 
@@ -741,6 +1235,23 @@ def run_script(js: str, *, adb_serial: str, frida_remote: str, process_name: str
         session.detach()
 
 
+def _load_wxa_template(template_ref: str, *, account_id: str) -> dict[str, Any]:
+    ref = template_ref.strip()
+    if not ref:
+        raise ValueError("template 不能为空")
+    path = Path(ref)
+    if path.suffix.lower() == ".json" and path.is_file():
+        raw = path.read_text(encoding="utf-8").lstrip()
+        if raw.startswith("{"):
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError(f"wxa template 结构非法: {path}")
+            return payload
+    from app.broadcast.wxa_templates import load_template as load_wxa
+
+    return load_wxa(ref, account_id=(account_id or None))
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="WeCom h8y send engine")
     parser.add_argument("--account-id", default="", help="账号命名空间（默认读取当前登录账号）")
@@ -761,6 +1272,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_text.add_argument("--conv-local", required=True)
     p_text.add_argument("--body", required=True)
 
+    p_at = sub.add_parser("at", help="send @all plus text in a group")
+    p_at.add_argument("--conv-local", required=True)
+    p_at.add_argument("--body", required=True)
+
+    p_notice = sub.add_parser("notice", help="publish a group notice")
+    p_notice.add_argument("--conv-local", required=True)
+    p_notice.add_argument("--body", required=True)
+
     p_image = sub.add_parser("image", help="send image by local path on Android")
     p_image.add_argument("--conv-local", required=True)
     p_image.add_argument("--image-path", required=True)
@@ -768,6 +1287,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_oa = sub.add_parser("oa", help="send official-account appmsg by template")
     p_oa.add_argument("--conv-local", required=True)
     p_oa.add_argument("--template", required=True, help="template id or template json path")
+
+    p_wxa = sub.add_parser("wxa", help="send mini-program card (contentType 78)")
+    p_wxa.add_argument("--conv-local", required=True)
+    p_wxa.add_argument("--template", required=True, help="wxa template id or template json path")
 
     p_video = sub.add_parser("video", help="send short video by local path on Android")
     p_video.add_argument("--conv-local", required=True)
@@ -786,6 +1309,7 @@ def main(argv: list[str] | None = None) -> int:
     video_path = getattr(args, "video_path", "")
     thumb_path = getattr(args, "thumb_path", "")
     oa_template_json = ""
+    wxa_template_json = ""
     silk_path = getattr(args, "silk_path", "")
     if action == "voice":
         silk_path = stage_voice_via_adb(args.adb_serial, silk_path)
@@ -798,6 +1322,9 @@ def main(argv: list[str] | None = None) -> int:
     if action == "oa":
         template = load_template(getattr(args, "template"), account_id=(args.account_id or None))
         oa_template_json = json.dumps(template, ensure_ascii=False)
+    if action == "wxa":
+        template = _load_wxa_template(getattr(args, "template"), account_id=(args.account_id or ""))
+        wxa_template_json = json.dumps(template, ensure_ascii=False)
     js = build_js(
         action=action,
         conv_local=args.conv_local,
@@ -809,14 +1336,26 @@ def main(argv: list[str] | None = None) -> int:
         thumb_path=thumb_path,
         duration=getattr(args, "duration", 0),
         oa_template_json=oa_template_json,
+        wxa_template_json=wxa_template_json,
         activity_guard=args.activity_guard,
     )
+    wait_seconds = args.wait_seconds
+    conv_local = str(args.conv_local)
+    if action in {"at", "notice"}:
+        body = str(getattr(args, "body", "") or "")
+        if not body.strip():
+            print(f"[send_engine] action={action} error=empty body")
+            print(f"[send_engine] action={action} return=false")
+            return 2
+        wait_seconds = max(wait_seconds, 8.0)
+    if conv_local.startswith("friend:") or conv_local.startswith("788"):
+        wait_seconds = max(wait_seconds, 8.0)
     return run_script(
         js,
         adb_serial=args.adb_serial,
         frida_remote=args.frida_remote,
         process_name=args.process_name,
-        wait_seconds=args.wait_seconds,
+        wait_seconds=wait_seconds,
     )
 
 

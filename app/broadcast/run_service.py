@@ -28,6 +28,7 @@ class RunService:
         resume_uuid: str = "",
         only_failed: bool = False,
         only_step_indexes: set[int] | None = None,
+        only_keys: set[tuple[int, int]] | None = None,
         progress_cb: ProgressCallback | None = None,
         dry_run: bool = False,
         run_uuid: str = "",
@@ -41,10 +42,14 @@ class RunService:
         )
         if resume_uuid:
             runner.run_uuid = resume_uuid
+            if only_keys is not None:
+                return runner._run_from(start_step_index=0, only_keys=only_keys)
             if only_step_indexes is not None:
                 return runner._run_from(start_step_index=0, only_step_indexes=only_step_indexes)
             return runner.resume(resume_uuid, only_failed=only_failed)
         runner.run_uuid = run_uuid.strip() or str(uuid.uuid4())
+        if only_keys is not None:
+            return runner._run_from(start_step_index=0, only_keys=only_keys)
         if only_step_indexes is not None:
             return runner._run_from(start_step_index=0, only_step_indexes=only_step_indexes)
         return runner.run()

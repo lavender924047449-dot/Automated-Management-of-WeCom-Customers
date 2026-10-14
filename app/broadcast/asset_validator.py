@@ -5,6 +5,7 @@
 - VoiceStep → silk 文件存在 + 头 4 字节 magic + duration>0
 - ImageStep/VideoStep → Path.exists() + os.access(R_OK)
 - OaStep → load_oa_template 能读回 JSON
+- WxaStep → load_wxa_template 能读回，且带卡片字段
 - BundleStep → 展开后每个子 step 递归上面几条
 """
 
@@ -20,6 +21,7 @@ from app.broadcast.library import VoiceLibrary
 from app.broadcast.oa_templates import load_template as load_oa_template
 from app.broadcast.paths import VOICE_LIB_ROOT
 from app.broadcast.video_templates import load_template as load_video_template
+from app.broadcast.wxa_templates import has_card_fields, load_template as load_wxa_template
 
 # Tencent SILK v3：常见头是 b"\x02#!SILK_V3" 或 b"#!SILK_V3"，只看前 4 字节。
 _SILK_HEADS = (b"\x02#!", b"#!SI")
@@ -28,7 +30,7 @@ _SILK_HEADS = (b"\x02#!", b"#!SI")
 def validate_step_payload(payload: dict[str, Any], *, account_id: str) -> tuple[bool, str]:
     """校验单个 sequence step 是否可发送。返回 (ok, error_message)。"""
     step_type = str(payload.get("type", "")).strip()
-    if step_type == "text":
+    if step_type in {"text", "at", "notice"}:
         return _validate_text(payload, account_id=account_id)
     if step_type == "voice":
         return _validate_voice(payload, account_id=account_id)
@@ -36,8 +38,10 @@ def validate_step_payload(payload: dict[str, Any], *, account_id: str) -> tuple[
         return _validate_image(payload)
     if step_type == "video":
         return _validate_video(payload)
-    if step_type == "oa":
+    if step_type in {"oa", "doc", "channel"}:
         return _validate_oa(payload, account_id=account_id)
+    if step_type == "wxa":
+        return _validate_wxa(payload, account_id=account_id)
     if step_type == "bundle":
         return _validate_bundle(payload, account_id=account_id)
     return True, ""
@@ -169,6 +173,35 @@ def _validate_oa(payload: dict[str, Any], *, account_id: str) -> tuple[bool, str
     return True, ""
 
 
+def _validate_wxa(payload: dict[str, Any], *, account_id: str) -> tuple[bool, str]:
+    template_id = str(payload.get("template_id", "")).strip()
+    if not template_id:
+        return False, "wxa template_id 为空"
+    try:
+        data = load_wxa_template(template_id, account_id=account_id)
+    except Exception as exc:
+        return False, f"小程序模板加载失败: {exc}"
+    if not has_card_fields(data):
+        return False, "小程序模板缺少卡片字段，请重新采集后再发送"
+    return True, ""
+
+
+def _text_template_exists(item_id: str, account_id: str) -> bool:
+    try:
+        VoiceLibrary.load(account_id=account_id).get_text_template(item_id)
+        return True
+    except Exception:
+        return False
+
+
+def _wxa_card_exists(item_id: str, account_id: str) -> bool:
+    try:
+        data = load_wxa_template(item_id, account_id=account_id)
+    except Exception:
+        return False
+    return has_card_fields(data)
+
+
 def _validate_bundle(payload: dict[str, Any], *, account_id: str) -> tuple[bool, str]:
     bundle_id = str(payload.get("bundle_id", "")).strip()
     if not bundle_id:
@@ -185,8 +218,14 @@ def _validate_bundle(payload: dict[str, Any], *, account_id: str) -> tuple[bool,
             item_payload = {"type": "voice", "voice_id": item_id}
         elif asset_type == "text":
             item_payload = {"type": "text", "template_id": item_id, "variant_pick": "random"}
-        elif asset_type == "oa":
-            item_payload = {"type": "oa", "template_id": item_id}
+        elif asset_type == "link" and not _text_template_exists(item_id, account_id) and _wxa_card_exists(item_id, account_id):
+            item_payload = {"type": "wxa", "template_id": item_id}
+        elif asset_type == "link":
+            item_payload = {"type": "text", "template_id": item_id, "variant_pick": "random", "text_kind": "link"}
+        elif asset_type == "wxa":
+            item_payload = {"type": "wxa", "template_id": item_id}
+        elif asset_type in {"oa", "doc", "channel"}:
+            item_payload = {"type": asset_type, "template_id": item_id}
         elif asset_type == "image":
             try:
                 data = load_image_template(item_id, account_id=account_id)

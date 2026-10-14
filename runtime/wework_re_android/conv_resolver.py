@@ -52,6 +52,9 @@ class ConversationHit:
     peer_name: str = ""
     our_remark: str = ""
     label_ids: tuple[str, ...] | None = None
+    corp_name: str = ""
+    # scene=1（我的客户）标签命中。中文名解析失败时仍然为 True，供内外分类使用。
+    has_external_label: bool = False
 
 
 def _safe_literal(value: str, default: str | list[str]) -> str | list[str]:
@@ -122,20 +125,28 @@ def _pick_group_peer_name(group_candidates: dict, peer_name: str) -> str:
     return peer_name
 
 
-def _hit_from_json(obj: dict) -> ConversationHit:
+def _hit_from_json(obj: dict, *, account_label_map: dict[str, str] | None = None) -> ConversationHit:
     # 新格式 payload 用 labelIds（string 数组），老格式 fixture 用 labels（已解析字符串）
     peer_name = str(obj.get("peerName", obj.get("name", ""))).strip()
     our_remark = str(obj.get("ourRemark", "")).strip()
+    corp_name = str(obj.get("corpName", "")).strip()
+    label_ids: tuple[str, ...] | None
     if "labelIds" in obj:
         label_ids = tuple(str(x) for x in (obj.get("labelIds") or []))
         live_label_names = [str(x).strip() for x in (obj.get("labelNames") or []) if str(x).strip()]
-        label_names_map = _load_label_names_map()
+        # Step 2 三级兜底：实时名 → 账号缓存 → 全局 JSON
+        acct_map = account_label_map or {}
+        global_map = _load_label_names_map()
         resolved: list[str] = []
         for name in live_label_names:
             if name not in resolved:
                 resolved.append(name)
         for lid in label_ids:
-            name = label_names_map.get(lid, "").strip()
+            # 已经从 live names 拿到了就跳过
+            if any(n == (acct_map.get(lid) or global_map.get(lid, "")).strip() for n in resolved):
+                # 防止重复：如果实时名已包含这个 id 对应的名字，跳过
+                pass
+            name = acct_map.get(lid, "").strip() or global_map.get(lid, "").strip()
             if name and name not in resolved:
                 resolved.append(name)
                 continue
@@ -143,10 +154,13 @@ def _hit_from_json(obj: dict) -> ConversationHit:
             # 直接丢掉，避免用备注后缀等非标签来源造成错误展示。
             if lid.isdigit():
                 continue
-            resolved.append(lid)
+            if lid not in resolved:
+                resolved.append(lid)
         labels = tuple(resolved)
     else:
+        label_ids = None
         labels = tuple(str(x) for x in (obj.get("labels") or []))
+    has_external_label = bool(obj.get("hasExternalLabel")) or bool(label_ids)
     conv_type = int(obj.get("type", -1)) if obj.get("type") is not None else -1
     # 决定"显示名"：单聊优先我们的备注；群优先群自定义名/群备注；否则 peerName 兜底
     if conv_type == 1:
@@ -174,6 +188,8 @@ def _hit_from_json(obj: dict) -> ConversationHit:
         peer_name=peer_name,
         our_remark=our_remark,
         label_ids=label_ids if "labelIds" in obj else None,
+        corp_name=corp_name,
+        has_external_label=has_external_label,
     )
 
 
@@ -234,13 +250,13 @@ def parse_hits(output: str) -> list[ConversationHit]:
     return hits
 
 
-def parse_rows(output: str) -> list[ConversationHit]:
+def parse_rows(output: str, *, account_label_map: dict[str, str] | None = None) -> list[ConversationHit]:
     """从 list_conversations_with_names.py 的 stdout 解析完整 row 记录（JSONL 优先，正则兜底）。"""
 
     rows: list[ConversationHit] = []
     for obj in _iter_json_events(output):
         if obj.get("t") == "row":
-            rows.append(_hit_from_json(obj))
+            rows.append(_hit_from_json(obj, account_label_map=account_label_map))
     if rows:
         return rows
     # 兼容旧文本格式
@@ -262,6 +278,32 @@ def parse_rows(output: str) -> list[ConversationHit]:
             )
         )
     return rows
+
+
+def parse_friends(output: str) -> list[dict]:
+    """从 list_conversations_with_names.py 的 stdout 解析 t:'friend' 好友快照。
+
+    返回 dict 列表，每条含 remote/remark/displayName/name/corpName/labelIds/labelNames。
+    这些好友来自 GetCachedContactList()，含"已添加但未开过对话的"联系人。
+    """
+    friends: list[dict] = []
+    for obj in _iter_json_events(output):
+        if obj.get("t") == "friend":
+            friends.append(obj)
+    return friends
+
+
+def parse_label_map(output: str) -> dict[str, str]:
+    """从 stdout 解析 t:'label_map' 事件，返回 {label_id: 中文名}。
+
+    用于 Step 2 写入账号级缓存。可能为空（异步回调超时、无标签等）。
+    """
+    for obj in _iter_json_events(output):
+        if obj.get("t") == "label_map":
+            raw = obj.get("map") or {}
+            if isinstance(raw, dict):
+                return {str(k).strip(): str(v).strip() for k, v in raw.items() if str(v).strip()}
+    return {}
 
 
 def _score_hit(keyword: str, hit: ConversationHit) -> int:
@@ -464,6 +506,71 @@ def list_conversations(
         if diag_lines:
             raise RuntimeError("会话枚举返回 0 条。诊断日志：\n" + "\n".join(diag_lines))
     return list(dedup.values())
+
+
+def list_conversations_and_friends(
+    *,
+    refresh: bool = False,
+    wait_seconds: float = 8.0,
+    python_executable: str | None = None,
+    module: str = "runtime.wework_re_android.list_conversations_with_names",
+    run_fn: Callable[..., subprocess.CompletedProcess[str]] = run_hidden,
+) -> tuple[list[ConversationHit], list[dict], dict[str, str]]:
+    """一次 attach 同时返回会话行、好友快照和标签名映射。
+
+    返回 (conversation_hits, friend_dicts, label_name_map)。
+    - friend_dicts 来自 GetCachedContactList()，每条含
+      remote/remark/displayName/name/corpName/labelIds/labelNames。
+    - label_name_map 是 {label_id: 中文名}，用于写入账号级缓存。
+    """
+    from app.bootstrap.frozen_dispatch import build_python_module_cmd
+
+    extra = ["--wait-seconds", str(wait_seconds)]
+    if refresh:
+        extra.append("--refresh")
+    if python_executable and not bool(getattr(sys, "frozen", False)):
+        cmd = [python_executable, "-m", module, *extra]
+    else:
+        cmd = build_python_module_cmd(module, *extra)
+
+    proc = run_fn(
+        cmd, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip() or "unknown error"
+        raise RuntimeError(f"会话查询失败: {err}")
+
+    merged = f"{proc.stdout}\n{proc.stderr}"
+
+    # --- 标签 id→名字 映射（Step 2: 先解析，用于 parse_rows 的三级兜底） ---
+    label_map = parse_label_map(merged)
+
+    # --- 会话行（与 list_conversations 相同的去重逻辑） ---
+    rows = parse_rows(merged, account_label_map=label_map)
+    dedup: dict[tuple[str, str], ConversationHit] = {}
+    for row in rows:
+        key = (
+            (row.conv_local, row.remote)
+            if row.conv_local and row.conv_local != "?"
+            else ("?", row.remote)
+        )
+        dedup[key] = row
+    if not dedup and proc.stderr.strip():
+        diag_lines = [
+            ln for ln in proc.stderr.splitlines()
+            if ln.startswith("[total=") or ln.startswith("[log]")
+            or ln.startswith("[after]") or ln.startswith("[now]")
+        ]
+        if diag_lines:
+            raise RuntimeError(
+                "会话枚举返回 0 条。诊断日志：\n" + "\n".join(diag_lines)
+            )
+
+    # --- 好友快照 ---
+    friends = parse_friends(merged)
+
+    return list(dedup.values()), friends, label_map
 
 
 def _parse_args() -> argparse.Namespace:

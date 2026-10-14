@@ -12,7 +12,9 @@ from typing import Any
 from app.broadcast.paths import account_reports_dir
 from app.security import get_secure_store
 
-COMPLETE_STATUSES = frozenset({"sent", "blocked", "resolve_failed"})
+# 旧游标接口只按 step_index 推进；为兼容“失败即终态”语义，把 failed 也计为已完成。
+# paused 不是终态，接续时应从 paused 那一条继续。
+COMPLETE_STATUSES = frozenset({"sent", "failed", "blocked", "resolve_failed"})
 _SECURE_STORE = get_secure_store()
 
 
@@ -77,7 +79,7 @@ class ReportStore:
 
     def load_report(self, run_uuid: str) -> ReportView:
         target = self.report_path(run_uuid)
-        rows = _SECURE_STORE.load_jsonl(target)
+        rows = _normalize_report_rows(_SECURE_STORE.load_jsonl(target), target)
         return ReportView(run_uuid=run_uuid, path=target, rows=rows)
 
     def export_csv(self, run_uuid: str, out_path: str | Path | None = None) -> Path:
@@ -107,6 +109,44 @@ class ReportStore:
             updated_at = datetime.fromtimestamp(path.stat().st_mtime)
             reports.append(ReportMeta(run_uuid=run_uuid, path=path, updated_at=updated_at))
         return sorted(reports, key=lambda x: x.updated_at, reverse=True)
+
+    def rename_plan(self, run_uuid: str, name: str) -> bool:
+        """把这次执行记录里的计划名称改成用户起的名字。"""
+        text = str(name or "").strip()
+        run_uuid = str(run_uuid or "").strip()
+        if not text or not run_uuid:
+            return False
+        target = self.report_path(run_uuid)
+        if not target.exists():
+            return False
+        view = self.load_report(run_uuid)
+        found = False
+        rewritten: list[dict[str, Any]] = []
+        for row in view.rows:
+            copied = dict(row)
+            if str(copied.get("type", "")).strip() == "plan_meta":
+                copied["name"] = text
+                plan = copied.get("plan")
+                if isinstance(plan, dict):
+                    plan = dict(plan)
+                    plan["name"] = text
+                    copied["plan"] = plan
+                found = True
+            rewritten.append(copied)
+        if not found:
+            return False
+        temp = target.with_suffix(".jsonl.tmp")
+        temp.unlink(missing_ok=True)
+        try:
+            for row in rewritten:
+                payload = dict(row)
+                payload.setdefault("ts", _now_iso())
+                _SECURE_STORE.append_jsonl(temp, payload, encrypt=True)
+            temp.replace(target)
+        except Exception:
+            temp.unlink(missing_ok=True)
+            raise
+        return True
 
     def delete_reports(self, run_uuids: list[str]) -> int:
         removed = 0
@@ -141,5 +181,31 @@ class ReportStore:
             removed += 1
         return removed
 
+
+def _normalize_report_rows(rows: list[dict[str, Any]], path: Path) -> list[dict[str, Any]]:
+    """把旧报告补成当前读取模型，但不改写磁盘上的历史文件。"""
+    try:
+        fallback_started_at = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+    except OSError:
+        fallback_started_at = _now_iso()
+
+    normalized: list[dict[str, Any]] = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        if str(row.get("type", "")).strip() == "plan_meta":
+            if not str(row.get("started_at", "") or "").strip():
+                row["started_at"] = str(row.get("ts", "") or "").strip() or fallback_started_at
+            if "name" not in row:
+                plan = row.get("plan")
+                row["name"] = str(plan.get("name", "") or "") if isinstance(plan, dict) else ""
+        else:
+            try:
+                row["inner_index"] = int(row.get("inner_index", -1))
+            except (TypeError, ValueError):
+                row["inner_index"] = -1
+        normalized.append(row)
+    return normalized
 
 __all__ = ["COMPLETE_STATUSES", "ReportMeta", "ReportStore", "ReportView"]

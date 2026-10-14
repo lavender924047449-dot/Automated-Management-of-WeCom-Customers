@@ -75,6 +75,47 @@ def parse_cron_expr(expr: str) -> dict[str, Any]:
     raise ValueError(f"不支持的 cron 表达式: {expr}")
 
 
+_WEEKDAY_LABEL = {
+    "mon": "一",
+    "tue": "二",
+    "wed": "三",
+    "thu": "四",
+    "fri": "五",
+    "sat": "六",
+    "sun": "日",
+}
+
+
+def cron_expr_label(expr: str) -> str:
+    """把 daily@/weekly@ 表达式写成「每天 09:00」「每周三 09:00」。"""
+    parsed = parse_cron_expr(expr)
+    hhmm = f"{int(parsed['hour']):02d}:{int(parsed['minute']):02d}"
+    weekday = str(parsed.get("day_of_week", "")).strip()
+    if not weekday:
+        return f"每天 {hhmm}"
+    short = _WEEKDAY_LABEL.get(weekday, weekday)
+    return f"每周{short} {hhmm}"
+
+
+def next_cron_fire(expr: str, now: datetime) -> datetime:
+    """下一次循环触发时刻。若当前时刻刚好落在触发点上，返回再下一轮。"""
+    parsed = parse_cron_expr(expr)
+    hour = int(parsed["hour"])
+    minute = int(parsed["minute"])
+    base = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    weekday = str(parsed.get("day_of_week", "")).strip()
+    if not weekday:
+        if base <= now:
+            base += timedelta(days=1)
+        return base
+    target = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}[weekday]
+    days = (target - base.weekday()) % 7
+    base += timedelta(days=days)
+    if base <= now:
+        base += timedelta(days=7)
+    return base
+
+
 def _parse_hh_mm(value: str) -> dict[str, int]:
     body = value.strip()
     if ":" not in body:
@@ -337,6 +378,7 @@ class BroadcastScheduler:
                 self._fire_job,
                 trigger="date",
                 run_date=run_at,
+                args=[entry.id],
                 id=entry.id,
                 replace_existing=True,
             )
@@ -346,6 +388,7 @@ class BroadcastScheduler:
             self._scheduler.add_job(
                 self._fire_job,
                 trigger="cron",
+                args=[entry.id],
                 id=entry.id,
                 replace_existing=True,
                 **spec,
@@ -396,4 +439,6 @@ __all__ = [
     "BroadcastScheduler",
     "ScheduleEntry",
     "parse_cron_expr",
+    "cron_expr_label",
+    "next_cron_fire",
 ]

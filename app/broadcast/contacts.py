@@ -2,18 +2,37 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from typing import Callable
 
 from app.broadcast.dto import ContactRowDTO
 from app.broadcast.labels import LocalLabelStore
+from app.broadcast.paths import account_label_names_path
 from app.bootstrap.win_subprocess import run_hidden
-from runtime.wework_re_android.conv_resolver import ConversationHit, list_conversations
+from runtime.wework_re_android.conv_resolver import (
+    ConversationHit,
+    list_conversations,
+    list_conversations_and_friends,
+)
 
 # 系统会话（FTA=10004 / 团队助手等）remote id 特征：< 100000 的纯数字。
 _SYSTEM_REMOTE_MAX = 100000
 _SYSTEM_DISPLAY_NAMES = {"企业微信团队"}
+
+
+def _save_account_label_cache(account_id: str, label_map: dict[str, str]) -> None:
+    """Step 2：将 label_id→中文名 写入账号数据目录。
+
+    非空时覆盖已有缓存；失败静默（不影响主流程）。
+    """
+    try:
+        path = account_label_names_path(account_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(label_map, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def refresh_contacts(
@@ -25,11 +44,26 @@ def refresh_contacts(
     """拉当前账号的联系人列表。
 
     - 基础来源：`list_conversations`（企微会话列表，只含"打开过对话的"）
-    - 可选来源（`include_cached_friends=True`）：`ContactService.GetCachedContactList()`
-      追加尚未开过对话但已进入好友缓存的 User，remote 冲突时以会话数据为准。
+    - 可选来源（`include_cached_friends=True`）：同一次 Frida attach 里的
+      `ContactService.GetCachedContactList()` 好友快照，追加尚未开过对话但已进入
+      好友缓存的 User，remote 冲突时以会话数据为准。
+    - 代码中没有 Python 侧条数上限。现状上限等于 GetConversationList() 的消息列表
+      缓存长度 + GetCachedContactList() 的本地好友缓存长度。
     """
 
-    hits = list_conversations(refresh=refresh)
+    # Step 1 优化：一次 attach 同时拿会话 + 好友快照，省掉第二个子进程。
+    # Step 2：同时拿标签 id→名字映射，写入账号缓存。
+    if include_cached_friends:
+        hits, friend_dicts, label_map = list_conversations_and_friends(refresh=refresh)
+    else:
+        hits = list_conversations(refresh=refresh)
+        friend_dicts = []
+        label_map = {}
+
+    # Step 2：把标签映射写入账号数据目录（非空时覆盖；空时不清掉旧缓存）
+    if label_map:
+        _save_account_label_cache(account_id, label_map)
+
     label_store = LocalLabelStore.load(account_id=account_id)
     rows: list[ContactRowDTO] = []
     seen_remote: set[str] = set()
@@ -72,32 +106,42 @@ def refresh_contacts(
             seen_remote.add(remote_norm)
 
     if include_cached_friends:
-        for user in _list_cached_friends():
-            remote = str(user.get("remoteId", "")).strip()
+        for user in friend_dicts:
+            remote = str(user.get("remote", "") or user.get("remoteId", "")).strip()
             if not remote or remote in seen_remote:
                 continue
             # 过滤系统账号（FTA=10004 等 5 位以内数字）
             if remote.isdigit() and int(remote) < _SYSTEM_REMOTE_MAX:
                 continue
             display = (
-                str(user.get("realRemark", "")).strip()
+                str(user.get("remark", "")).strip()
                 or str(user.get("displayName", "")).strip()
                 or str(user.get("name", "")).strip()
-                or str(user.get("zhName", "")).strip()
             )
             if not display:
                 continue
             corp_name = str(user.get("corpName", "")).strip()
-            labels = list(label_store.labels_for(remote))
+            # 好友快照里已经带了 labelNames（由同一次 attach 解析）
+            friend_label_names = [
+                str(n) for n in (user.get("labelNames") or []) if str(n).strip()
+            ]
+            friend_label_ids = [
+                str(x).strip() for x in (user.get("labelIds") or []) if str(x).strip()
+            ]
+            labels = friend_label_names or list(label_store.labels_for(remote))
+            has_external_label = bool(user.get("hasExternalLabel")) or bool(friend_label_ids)
             rows.append(
                 ContactRowDTO(
-                    conv_local=f"friend:{remote}",  # 前缀标记：未开过会话的好友，广播前需先解析
+                    conv_local=f"friend:{remote}",
                     display_name=display,
                     remote=remote,
-                    category="内部同事" if not corp_name or "同事" in display else "外部客户",
+                    category=_category_for_friend(
+                        display=display,
+                        corp_name=corp_name,
+                        has_external_label=has_external_label,
+                    ),
                     labels=labels,
-                    peer_name=str(user.get("name", "")).strip()
-                    or str(user.get("zhName", "")).strip(),
+                    peer_name=str(user.get("name", "")).strip(),
                 )
             )
             seen_remote.add(remote)
@@ -175,22 +219,33 @@ def _merge_labels(hit: ConversationHit, *, label_store: LocalLabelStore) -> list
     return labels
 
 
+def _category_for_friend(*, display: str, corp_name: str, has_external_label: bool) -> str:
+    """好友缓存没有 conv_type。
+
+    scene=1 标签或非空公司名都是外部客户。公司名为空不再当成内部同事；
+    只在没有任何外部信号、且显示名里带「同事」时，才归到内部同事。
+    """
+    if has_external_label or corp_name.strip():
+        return "外部客户"
+    if "同事" in display:
+        return "内部同事"
+    return "外部客户"
+
+
 def _infer_category(hit: ConversationHit, *, display_name: str, labels: list[str]) -> str:
-    """分类优先看 raw 里的 conv_type：0=外部单聊、1=外部群、2=内部同事。"""
+    """分类：conv_type=2 内部同事，conv_type=1 外部群，其余默认外部客户。
+
+    scene=1 标签（has_external_label）和公司名只用来确认外部客户，
+    不再用「公司名为空」或名字里的「同事」把单聊判成内部。
+    """
+    del labels
     ct = getattr(hit, "conv_type", -1)
     if ct == 1:
         return "外部群"
     if ct == 2:
         return "内部同事"
-    if ct == 0:
-        # 单聊——用 corpName/标签兜底判内外
-        lower_labels = " ".join(labels).lower()
-        if "同事" in display_name or "internal" in lower_labels:
-            return "内部同事"
+    if getattr(hit, "has_external_label", False) or str(getattr(hit, "corp_name", "") or "").strip():
         return "外部客户"
-    # 未知类型：走文本兜底
-    if "同事" in display_name or "internal" in " ".join(labels).lower():
-        return "内部同事"
     if len(hit.members) > 1 or "群" in display_name:
         return "外部群"
     return "外部客户"

@@ -17,14 +17,11 @@ def test_voice_library_add_list_update_and_stats(tmp_path: Path):
     e1 = lib.add(file="20260915_133012_3s.silk", duration=3, note="开场问候")
     e2 = lib.add(file="20260915_133125_2s.silk", duration=2)
     lib.update_label(e2.id, "pitch_short")
-    lib.bump_usage(e2.id)
-    lib.bump_usage(e2.id)
 
     rows = lib.list()
     assert len(rows) == 2
     assert rows[0].note == "开场问候"
     assert rows[1].label == "pitch_short"
-    assert rows[1].usage_count == 2
 
     stats = lib.stats()
     assert stats["total"] == 2
@@ -101,4 +98,26 @@ def test_text_templates_roundtrip_and_archive(tmp_path: Path):
     loaded.archive_text_template(t1.id)
     assert loaded.list_text_templates() == []
     assert len(loaded.list_text_templates(include_archived=True)) == 1
+
+
+def test_captured_text_stays_unnamed_until_renamed(tmp_path: Path):
+    lib = VoiceLibrary(tmp_path / "voice_lib_index.json")
+    lib.add_text_template(
+        name="pending-id",
+        variants=["你好，这是从传输助手抓到的文字"],
+        template_id="pending-id",
+        unnamed=True,
+    )
+    lib.save()
+
+    loaded = VoiceLibrary.load(tmp_path / "voice_lib_index.json")
+    pending = loaded.get_text_template("pending-id")
+    assert pending.unnamed is True
+    assert pending.variants == ["你好，这是从传输助手抓到的文字"]
+
+    loaded.update_text_template("pending-id", name="开场白")
+    named = loaded.get_text_template("pending-id")
+    assert named.unnamed is False
+    assert named.name == "开场白"
+    assert named.variants == ["你好，这是从传输助手抓到的文字"]
 

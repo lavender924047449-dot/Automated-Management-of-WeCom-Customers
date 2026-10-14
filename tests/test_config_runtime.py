@@ -24,6 +24,14 @@ def test_dev_mode_not_frozen():
     assert bundled_root() == root
 
 
+def test_project_root_honors_home_env(monkeypatch, tmp_path: Path):
+    home = tmp_path / "install"
+    home.mkdir()
+    monkeypatch.setenv("TESTVOICE_HOME", str(home))
+    assert project_root() == home.resolve()
+    assert bundled_root() == home.resolve()
+
+
 def test_resolve_path_relative_and_absolute(tmp_path: Path):
     abs_p = tmp_path / "x.txt"
     abs_p.write_text("ok", encoding="utf-8")

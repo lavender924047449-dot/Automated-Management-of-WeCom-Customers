@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -15,7 +16,9 @@ from app.bootstrap.win_subprocess import install_global_no_window_patch
 from app.config import resolve_path
 from app.updater.frida_script_puller import pull_adapter_if_needed
 from app.util.logging import setup_logging
+from gui.copy_support import install_copy_support
 from gui.main_window import MainWindow
+from gui.zh_ui import install_zh_ui
 
 
 def _parse_args() -> argparse.Namespace:
@@ -53,7 +56,7 @@ def main() -> int:
     # 的 Popen、wxa QProcess 等）立即被 Windows 内核回收。彻底根治「托盘退出
     # 后 dist 目录里还残留 exe 进程 + 日志文件被占用」的老问题。
     # 只在 frozen 下启用：dev 态在 IDE 里跑，绑 job 会连带杀掉 IDE 里的其他子进程。
-    if bool(getattr(sys, "frozen", False)):
+    if bool(getattr(sys, "frozen", False)) or os.environ.get("TESTVOICE_HOME", "").strip():
         bind_kill_on_close()
 
     if not args.skip_bootstrap:
@@ -67,6 +70,8 @@ def main() -> int:
         logger.info("[adapter] {}", pull_result.message)
 
     app = QApplication(sys.argv)
+    install_zh_ui(app)
+    install_copy_support(app)
     index_path = Path(args.voice_index_path.strip()) if args.voice_index_path.strip() else None
     win = MainWindow(voice_index_path=index_path)
     win.show()

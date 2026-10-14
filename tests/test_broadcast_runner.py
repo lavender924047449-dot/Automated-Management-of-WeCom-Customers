@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -30,6 +31,14 @@ class _MockSendClient:
         self.calls.append(("text", conv_local, body, None))
         return "text" not in self.fail_types
 
+    def send_at(self, *, conv_local: str, body: str) -> bool:
+        self.calls.append(("at", conv_local, body, None))
+        return "at" not in self.fail_types
+
+    def send_notice(self, *, conv_local: str, body: str) -> bool:
+        self.calls.append(("notice", conv_local, body, None))
+        return "notice" not in self.fail_types
+
     def send_image(self, *, conv_local: str, image_path: str) -> bool:
         self.calls.append(("image", conv_local, image_path, None))
         return "image" not in self.fail_types
@@ -37,6 +46,10 @@ class _MockSendClient:
     def send_oa(self, *, conv_local: str, template: str) -> bool:
         self.calls.append(("oa", conv_local, template, None))
         return "oa" not in self.fail_types
+
+    def send_wxa(self, *, conv_local: str, template: str) -> bool:
+        self.calls.append(("wxa", conv_local, template, None))
+        return "wxa" not in self.fail_types
 
     def send_video(
         self,
@@ -61,9 +74,8 @@ def _make_plan(**overrides) -> BroadcastPlan:
             {"type": "image", "path": "/sdcard/Test-Voice/voice_lib/a.png"},
             {"type": "video", "path": "/sdcard/Test-Voice/voice_lib/a.mp4", "thumb_path": "/sdcard/Test-Voice/voice_lib/a.jpg", "duration": 8},
         ],
-        "msg_gap_seconds": [0, 0],
-        "contact_gap_seconds": [0, 0],
-        "perturb": False,
+        "step_gaps": [0, 0, 0, 0],
+        "contact_gap": 3.0,
     }
     data.update(overrides)
     return BroadcastPlan.model_validate(data)
@@ -82,15 +94,10 @@ def _prepare_voice_index(tmp_path: Path) -> Path:
 
 def test_runner_serial_flow_and_blocked(tmp_path: Path):
     index_path = _prepare_voice_index(tmp_path)
-    calls: list[tuple[float, float]] = []
     sleeps: list[float] = []
 
     def resolver(name: str) -> str:
         return {"海鸟与鱼": "1001", "张三": "1002"}[name]
-
-    def fake_rand(lo: float, hi: float) -> float:
-        calls.append((lo, hi))
-        return 0
 
     client = _MockSendClient()
     runner = BroadcastRunner(
@@ -99,7 +106,7 @@ def test_runner_serial_flow_and_blocked(tmp_path: Path):
         send_client=client,
         voice_index_path=index_path,
         account_id="test_account",
-        rand_fn=fake_rand,
+        rand_fn=lambda lo, hi: 0,
         sleep_fn=lambda s: sleeps.append(s),
     )
     summary = runner.run()
@@ -109,9 +116,10 @@ def test_runner_serial_flow_and_blocked(tmp_path: Path):
     assert counts.get("blocked", 0) == 0
     assert len(summary.records) == 10
     assert [x[0] for x in client.calls] == ["voice", "text", "oa", "image", "video", "voice", "text", "oa", "image", "video"]
-    assert all(seconds == 0 for seconds in sleeps)
-    # 每联系人 4 次消息间隔 + 1 次联系人间隔 = 9
-    assert len(calls) == 9
+    # step_gaps=[0,0,0,0] → clamp 到 3.0，每联系人 4 次消息间隔 + 1 次联系人间隔
+    # = 2*4 step gaps + 1 contact gap = 9 次 sleep
+    assert len(sleeps) == 9
+    assert all(s >= 3.0 for s in sleeps)
     assert summary.run_uuid
 
 
@@ -165,6 +173,31 @@ def test_runner_uses_conv_local_from_plan_contact_without_resolve(tmp_path: Path
     assert client.calls == [("text", "1001", "hi", None)]
 
 
+def test_runner_sends_wxa_template(tmp_path: Path, monkeypatch):
+    index_path = _prepare_voice_index(tmp_path)
+    monkeypatch.setattr(
+        "app.broadcast.runner.load_wxa_template",
+        lambda template_id, account_id=None: {"username": "gh_demo@app", "pagepath": "pages/index", "template_id": template_id},
+    )
+    client = _MockSendClient()
+    plan = _make_plan(
+        contacts=[{"conv_local": "1001", "display_name": "海鸟与鱼"}],
+        sequence=[{"type": "wxa", "template_id": "wxa-1"}],
+    )
+    runner = BroadcastRunner(
+        plan=plan,
+        resolver=lambda _n: "1001",
+        send_client=client,
+        voice_index_path=index_path,
+        account_id="test_account",
+        rand_fn=lambda _a, _b: 0,
+        sleep_fn=lambda _s: None,
+    )
+    summary = runner.run()
+    assert [r.status for r in summary.records] == ["sent"]
+    assert client.calls == [("wxa", "1001", "wxa-1", None)]
+
+
 def test_runner_failure_continues(tmp_path: Path):
     index_path = _prepare_voice_index(tmp_path)
     client = _MockSendClient()
@@ -185,14 +218,79 @@ def test_runner_failure_continues(tmp_path: Path):
     assert [x[0] for x in client.calls] == ["text", "image"]
 
 
+def test_runner_sends_at_and_notice(tmp_path: Path):
+    index_path = _prepare_voice_index(tmp_path)
+    client = _MockSendClient()
+    plan = _make_plan(
+        contacts=[{"conv_local": "1001", "display_name": "测试群000"}],
+        sequence=[
+            {"type": "at", "body": "大家好"},
+            {"type": "notice", "body": "本周公告"},
+        ],
+        step_gaps=[0],
+    )
+    runner = BroadcastRunner(
+        plan=plan,
+        resolver=lambda _n: "1001",
+        send_client=client,
+        voice_index_path=index_path,
+        account_id="test_account",
+        rand_fn=lambda _a, _b: 0,
+        sleep_fn=lambda _s: None,
+    )
+    summary = runner.run()
+    assert [r.status for r in summary.records] == ["sent", "sent"]
+    assert client.calls == [
+        ("at", "1001", "大家好", None),
+        ("notice", "1001", "本周公告", None),
+    ]
+
+
+def test_subprocess_client_at_body_with_leading_dashes(monkeypatch):
+    captured: list[list[str]] = []
+
+    class FakePopen:
+        def __init__(self, cmd, **_kwargs):
+            captured.append(list(cmd))
+            self.returncode = 0
+            self.stdout = io.StringIO("action=at return=true")
+            self.stderr = io.StringIO("")
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, **_kw):
+            pass
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("app.broadcast.runner.subprocess.Popen", FakePopen)
+    client = SubprocessSendClient(account_id="vid_A")
+    ok = client.send_at(conv_local="1001", body="--测试at")
+    assert ok is True
+    assert captured
+    assert any(arg == "--body=--测试at" for arg in captured[0])
+    assert "at" in captured[0]
+
+
 def test_subprocess_client_text_body_with_leading_dashes(monkeypatch):
     captured: list[list[str]] = []
 
-    def fake_run(cmd, **_kwargs):
-        captured.append(list(cmd))
-        return CompletedProcess(args=cmd, returncode=0, stdout="action=text return=true", stderr="")
+    class FakePopen:
+        def __init__(self, cmd, **_kwargs):
+            captured.append(list(cmd))
+            self.returncode = 0
+            self.stdout = io.StringIO("action=text return=true")
+            self.stderr = io.StringIO("")
+        def poll(self):
+            return self.returncode
+        def wait(self, **_kw):
+            pass
+        def kill(self):
+            pass
 
-    monkeypatch.setattr("app.broadcast.runner.subprocess.run", fake_run)
+    monkeypatch.setattr("app.broadcast.runner.subprocess.Popen", FakePopen)
     client = SubprocessSendClient(account_id="vid_A")
     ok = client.send_text(conv_local="1001", body="--测试文字")
     assert ok is True
@@ -203,15 +301,24 @@ def test_subprocess_client_text_body_with_leading_dashes(monkeypatch):
 def test_subprocess_client_passes_account_id(monkeypatch):
     captured: list[list[str]] = []
 
-    def fake_run(cmd, **_kwargs):
-        captured.append(list(cmd))
-        return CompletedProcess(args=cmd, returncode=0, stdout="action=text return=true", stderr="")
+    class FakePopen:
+        def __init__(self, cmd, **_kwargs):
+            captured.append(list(cmd))
+            self.returncode = 0
+            self.stdout = io.StringIO("action=text return=true")
+            self.stderr = io.StringIO("")
+        def poll(self):
+            return self.returncode
+        def wait(self, **_kw):
+            pass
+        def kill(self):
+            pass
 
-    monkeypatch.setattr("app.broadcast.runner.subprocess.run", fake_run)
+    monkeypatch.setattr("app.broadcast.runner.subprocess.Popen", FakePopen)
     client = SubprocessSendClient(python_executable="python", module="runtime.wework_re_android.send_engine", account_id="vid_A")
     ok = client.send_text(conv_local="1001", body="hello")
     assert ok is True
-    assert captured, "subprocess.run 应该被调用"
+    assert captured, "subprocess.Popen 应该被调用"
     assert "--account-id" in captured[0]
     idx = captured[0].index("--account-id")
     assert captured[0][idx + 1] == "vid_A"
@@ -337,8 +444,8 @@ def test_runner_retry_policy_and_report_rows(tmp_path: Path):
     )
     summary = runner.run()
     assert summary.records[0].status == "failed"
-    assert [x[0] for x in client.calls] == ["text", "text", "text"]
-    assert sum(sleeps) >= 60.0
+    assert [x[0] for x in client.calls] == ["text"]
+    assert sum(sleeps) < 1.0
 
     rows = [
         x
@@ -346,14 +453,7 @@ def test_runner_retry_policy_and_report_rows(tmp_path: Path):
         if str(x.get("type", "")).strip() != "plan_meta"
     ]
     statuses = [x["status"] for x in rows]
-    assert statuses == [
-        "before_send",
-        "retry_scheduled",
-        "before_send",
-        "retry_scheduled",
-        "before_send",
-        "failed",
-    ]
+    assert statuses == ["before_send", "failed"]
 
 
 def test_runner_fails_fast_when_frida_session_unavailable(tmp_path: Path):

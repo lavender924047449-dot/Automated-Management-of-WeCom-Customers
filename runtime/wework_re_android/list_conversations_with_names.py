@@ -148,9 +148,11 @@ Java.perform(function () {
         function finish() {
             if (calledDone) return;
             calledDone = true;
+            // Step 2: 发送完整的 id→中文名 映射表，供 Python 侧写入账号缓存
+            send({t: 'label_map', map: LABEL_NAMES_BY_ID});
             done();
         }
-        setTimeout(finish, 1200);
+        setTimeout(finish, 3500);
         try {
             var ULS = Java.use('com.tencent.wework.foundation.logic.UserLabelService').getService();
             if (!ULS) {
@@ -160,12 +162,24 @@ Java.perform(function () {
             var used = safe(function () { return ULS.GetUsedLabelIds(); });
             var idTexts = [];
             var idValues = [];
+            var idSeen = {};
             var JLong = Java.use('java.lang.Long');
-            for (var i = 0; used && i < used.length; i++) {
-                var text = String(used[i]);
+            function pushLabelId(raw) {
+                var text = String(raw || '').trim();
+                if (!text || idSeen[text]) return;
+                var parsed = safe(function () { return JLong.parseLong(text); });
+                if (parsed === null) return;
+                idSeen[text] = true;
                 idTexts.push(text);
-                idValues.push(JLong.parseLong(text));
+                idValues.push(parsed);
             }
+            for (var i = 0; used && i < used.length; i++) pushLabelId(used[i]);
+            // GetUsedLabelIds 在部分机型上为空，但 scene=1 的客户标签 id 已经在 LABELS_BY_REMOTE 里。
+            Object.keys(LABELS_BY_REMOTE).forEach(function (remote) {
+                var arr = LABELS_BY_REMOTE[remote] || [];
+                for (var k = 0; k < arr.length; k++) pushLabelId(arr[k]);
+            });
+            send({t: 'log', msg: 'label name lookup ids=' + idTexts.length});
             if (!idValues.length) {
                 finish();
                 return;
@@ -203,6 +217,34 @@ Java.perform(function () {
     var CS = null;
     try { CS = Java.use('com.tencent.wework.foundation.logic.ContactService').getService(); } catch (_) {}
 
+    function sleepMs(ms) {
+        try {
+            var Thread = Java.use('java.lang.Thread');
+            Thread.sleep.overload('long').call(Thread, ms);
+        } catch (_) {}
+    }
+
+    // 预热：缓存为空时试一次已有的同步入口，再短暂等待后重读。
+    // 只在空缓存时等待，避免每次刷新都空转。
+    if (CS) {
+        var firstTry = safe(function () { return CS.GetCachedContactList(); });
+        if (!firstTry || firstTry.length === 0) {
+            var syncMethods = ['SyncContactCache', 'SyncAllContact', 'FetchContactList', 'RefreshContactList'];
+            for (var sm = 0; sm < syncMethods.length; sm++) {
+                try {
+                    var fn = CS[syncMethods[sm]];
+                    if (typeof fn === 'function') {
+                        fn.call(CS);
+                        send({t: 'log', msg: 'contact preheat: called ' + syncMethods[sm]});
+                        break;
+                    }
+                } catch (_) {}
+            }
+            sleepMs(1200);
+            send({t: 'log', msg: 'contact preheat: waited 1200ms'});
+        }
+    }
+
     // remoteId → { remark, displayName, name, corpName }
     var USER_BY_REMOTE = {};
     if (CS) {
@@ -226,30 +268,37 @@ Java.perform(function () {
 
     // remoteId → [labelId,...]（外部客户标签，scene=1；若未来要加公司内标签再加 scene 0/2）
     var LABELS_BY_REMOTE = {};
-    if (CS) {
+    function buildLabelsByRemote() {
+        var out = {};
+        if (!CS) return out;
         var JLong = Java.use('java.lang.Long');
-        var scenes = [1];
-        scenes.forEach(function (scene) {
-            var ids = safe(function () { return CS.GetAllLabelIdsHasContact(scene); });
-            if (!ids) return;
-            for (var li = 0; li < ids.length; li++) {
-                var lidStr = String(ids[li]);
-                var lid = safe(function () { return JLong.parseLong(lidStr); });
-                if (lid === null) continue;
-                var users = safe(function () { return CS.GetLabelContactsByLabelId(lid, scene); });
-                if (!users) continue;
-                for (var uu = 0; uu < users.length; uu++) {
-                    var user = users[uu];
-                    if (!user) continue;
-                    var r = safe(function () { return String(user.getRemoteId()); });
-                    if (!r) continue;
-                    if (!LABELS_BY_REMOTE[r]) LABELS_BY_REMOTE[r] = [];
-                    if (LABELS_BY_REMOTE[r].indexOf(lidStr) < 0) LABELS_BY_REMOTE[r].push(lidStr);
-                }
+        var ids = safe(function () { return CS.GetAllLabelIdsHasContact(1); });
+        if (!ids) return out;
+        for (var li = 0; li < ids.length; li++) {
+            var lidStr = String(ids[li]);
+            var lid = safe(function () { return JLong.parseLong(lidStr); });
+            if (lid === null) continue;
+            var users = safe(function () { return CS.GetLabelContactsByLabelId(lid, 1); });
+            if (!users) continue;
+            for (var uu = 0; uu < users.length; uu++) {
+                var user = users[uu];
+                if (!user) continue;
+                var r = safe(function () { return String(user.getRemoteId()); });
+                if (!r) continue;
+                if (!out[r]) out[r] = [];
+                if (out[r].indexOf(lidStr) < 0) out[r].push(lidStr);
             }
-        });
-        send({t: 'log', msg: 'LABELS_BY_REMOTE size=' + Object.keys(LABELS_BY_REMOTE).length});
+        }
+        return out;
     }
+    LABELS_BY_REMOTE = buildLabelsByRemote();
+    if (CS && Object.keys(LABELS_BY_REMOTE).length === 0) {
+        // 标签索引偶尔晚于联系人缓存。只在首次为空时再等一次，不循环重试。
+        sleepMs(1200);
+        LABELS_BY_REMOTE = buildLabelsByRemote();
+        send({t: 'log', msg: 'label index retry after 1200ms'});
+    }
+    send({t: 'log', msg: 'LABELS_BY_REMOTE size=' + Object.keys(LABELS_BY_REMOTE).length});
 
     function decodeProtoEscaped(raw) {
         var JavaString = Java.use('java.lang.String');
@@ -404,6 +453,7 @@ Java.perform(function () {
                 groupCandidates: groupCandidates, // 群候选：{getName: ..., getRemark: ..., ...}
                 labelIds: labelIds,              // Long id 字符串数组，Python 侧转中文
                 labelNames: labelNames,          // 主线程标签缓存解析出的中文名
+                hasExternalLabel: labelIds.length > 0,  // scene=1 标签命中，分类用，不依赖中文名是否解析成功
                 raw: rawStr
             });
             if (keyword && (peerName.indexOf(keyword) >= 0 || ourRemark.indexOf(keyword) >= 0 || rawStr.indexOf(keyword) >= 0)) {
@@ -412,9 +462,43 @@ Java.perform(function () {
         }
     }
 
+    // ==================== 好友快照输出 ====================
+    // Step 1 补全：把 USER_BY_REMOTE 里的好友也输出成 t:'friend' 行，
+    // Python 侧 contacts.py 可以直接合并，不必再起第二个 list_all_contacts 子进程。
+    // 注意：代码里没有 Python 侧条数上限。现状上限等于 GetCachedContactList()
+    // 的本地好友缓存长度（取决于企微是否加载过通讯录，上面已做预热）。
+    function dumpFriends() {
+        var remotes = Object.keys(USER_BY_REMOTE);
+        send({t: 'friends_total', n: remotes.length});
+        for (var fi = 0; fi < remotes.length; fi++) {
+            var r = remotes[fi];
+            var snap = USER_BY_REMOTE[r];
+            var friendLabelIds = LABELS_BY_REMOTE[r] ? LABELS_BY_REMOTE[r].slice() : [];
+            var friendLabelNames = [];
+            for (var fli = 0; fli < friendLabelIds.length; fli++) {
+                var flname = LABEL_NAMES_BY_ID[friendLabelIds[fli]] || '';
+                if (flname && friendLabelNames.indexOf(flname) < 0) friendLabelNames.push(flname);
+            }
+            send({
+                t: 'friend',
+                remote: r,
+                remark: snap.remark || '',
+                displayName: snap.displayName || '',
+                name: snap.name || '',
+                corpName: snap.corpName || '',
+                labelIds: friendLabelIds,
+                labelNames: friendLabelNames,
+                hasExternalLabel: friendLabelIds.length > 0
+            });
+        }
+    }
+
     refreshLabelNameMap(function () {
         // 先 dump 一次（拿本地缓存），保证即使 refresh 回调不来也有结果。
-        Java.scheduleOnMainThread(function () { dumpAll('now'); });
+        Java.scheduleOnMainThread(function () {
+            dumpAll('now');
+            dumpFriends();
+        });
 
         if (doRefresh) {
             var CB = Java.registerClass({
@@ -453,9 +537,9 @@ def on_msg(m, _):
     if m.get("type") == "send":
         p = m["payload"] or {}
         t = p.get("t")
-        if t in ("row", "hit"):
+        if t in ("row", "hit", "friend", "label_map"):
             _emit_stdout_json(p)
-        elif t == "total":
+        elif t in ("total", "friends_total"):
             line = f"[{p['tag']}] total={p['n']}"
             sys.stderr.write(line + "\n"); sys.stderr.flush()
             _emit_stdout_json(p)

@@ -11,7 +11,9 @@ from pydantic import ValidationError
 from app.broadcast.plan import (
     BroadcastPlan,
     DEFAULT_CONTACT_GAP,
+    DEFAULT_CONTACT_GAP_FLAT,
     DEFAULT_MSG_GAP,
+    DEFAULT_STEP_GAP,
     ImageStep,
     load_plan,
     save_plan,
@@ -27,9 +29,8 @@ def _valid_payload(**overrides):
             {"type": "text", "body": "你好，方便聊聊吗？"},
             {"type": "image", "path": "/sdcard/Test-Voice/voice_lib/demo.png"},
         ],
-        "msg_gap_seconds": [8, 25],
-        "contact_gap_seconds": [45, 120],
-        "perturb": True,
+        "step_gaps": [10.0, 10.0],
+        "contact_gap": 60.0,
     }
     data.update(overrides)
     return data
@@ -40,9 +41,8 @@ def test_valid_plan_roundtrip(tmp_path: Path):
     assert [x.display_name for x in plan.contacts] == ["海鸟与鱼", "张三"]
     assert [x.conv_local for x in plan.contacts] == ["", ""]
     assert [step.type for step in plan.sequence] == ["voice", "text", "image"]
-    assert plan.msg_gap_seconds == (8.0, 25.0)
-    assert plan.contact_gap_seconds == (45.0, 120.0)
-    assert plan.perturb is True
+    assert plan.step_gaps == [10.0, 10.0]
+    assert plan.contact_gap == 60.0
     assert plan.has_blocked_steps() is False
     assert all(step_status(step) == "ready" for step in plan.sequence)
 
@@ -103,10 +103,11 @@ def test_empty_or_blank_fields_rejected():
         BroadcastPlan.model_validate(
             _valid_payload(sequence=[{"type": "text", "body": "   "}])
         )
-    with pytest.raises(ValidationError):
-        BroadcastPlan.model_validate(
-            _valid_payload(msg_gap_seconds=[25, 8])
-        )
+    # step_gaps 值 < 3 会被 clamp 到 3，不抛异常
+    plan = BroadcastPlan.model_validate(
+        _valid_payload(step_gaps=[1.0, 1.0])
+    )
+    assert all(g >= 3.0 for g in plan.step_gaps)
     with pytest.raises(ValidationError):
         BroadcastPlan.model_validate(
             _valid_payload(sequence=[{"type": "text", "template_id": "tpl-1", "variant_pick": "pick:1"}])
@@ -156,23 +157,29 @@ def test_image_is_ready_after_step_35():
     assert plan.has_blocked_steps() is False
 
 
-def test_phase_b_types_parse_but_marked_not_implemented():
+def test_doc_and_channel_are_ready_link_cards():
     plan = BroadcastPlan.model_validate(
         _valid_payload(
             sequence=[
                 {"type": "text", "body": "先发文字"},
                 {"type": "oa", "template_id": "oa-1"},
+                {"type": "doc", "template_id": "doc-1"},
                 {"type": "wxa", "template_id": "wxa-1", "thumb_path": "/sdcard/t.png"},
                 {"type": "video", "path": "/sdcard/a.mp4", "duration": 8},
                 {"type": "channel", "template_id": "ch-1"},
             ]
         )
     )
-    assert [step.type for step in plan.ready_sequence()] == ["text", "oa", "video"]
-    blocked = plan.blocked_summary()
-    assert [row["type"] for row in blocked] == ["wxa", "channel"]
-    assert all(row["status"] == "not_implemented" for row in blocked)
-    assert plan.has_blocked_steps() is True
+    assert [step.type for step in plan.ready_sequence()] == [
+        "text",
+        "oa",
+        "doc",
+        "wxa",
+        "video",
+        "channel",
+    ]
+    assert plan.blocked_summary() == []
+    assert plan.has_blocked_steps() is False
 
 
 def test_default_gaps_match_step6_tuning():
@@ -180,8 +187,97 @@ def test_default_gaps_match_step6_tuning():
         {
             "contacts": ["海鸟与鱼"],
             "sequence": [{"type": "text", "body": "hello"}],
+        }
+    )
+    # 单条序列 → step_gaps 为空列表（长度 = 0）
+    assert plan.step_gaps == []
+    assert plan.contact_gap == DEFAULT_CONTACT_GAP_FLAT
+
+
+def test_backward_compat_old_format():
+    """旧格式 msg_gap_seconds / contact_gap_seconds / perturb 正确迁移。"""
+    plan = BroadcastPlan.model_validate(
+        {
+            "contacts": ["海鸥"],
+            "sequence": [
+                {"type": "text", "body": "a"},
+                {"type": "text", "body": "b"},
+            ],
+            "msg_gap_seconds": [10, 30],
+            "contact_gap_seconds": [60, 150],
             "perturb": True,
         }
     )
-    assert plan.msg_gap_seconds == DEFAULT_MSG_GAP
-    assert plan.contact_gap_seconds == DEFAULT_CONTACT_GAP
+    # step_gaps 取 (10+30)/2 = 20.0
+    assert len(plan.step_gaps) == 1
+    assert plan.step_gaps[0] == 20.0
+    # contact_gap 取 (60+150)/2 = 105.0
+    assert plan.contact_gap == 105.0
+
+
+def test_plan_name_and_expanded_bundle_snapshot():
+    plan = BroadcastPlan.model_validate(
+        {
+            "name": "  早报  ",
+            "contacts": ["海鸟与鱼"],
+            "sequence": [
+                {
+                    "type": "bundle",
+                    "bundle_id": "b1",
+                    "bundle_name": "晨间包",
+                    "presentation": "expanded",
+                    "items": [
+                        {"type": "text", "body": "甲", "display_name": "问候"},
+                        {"type": "text", "body": "乙"},
+                    ],
+                    "item_gaps": [4],
+                }
+            ],
+        }
+    )
+    assert plan.name == "早报"
+    bundle = plan.sequence[0]
+    assert bundle.presentation == "expanded"
+    assert bundle.bundle_name == "晨间包"
+    assert [item.body for item in bundle.items] == ["甲", "乙"]
+    assert bundle.item_gaps == [4.0]
+    assert bundle.items[0].display_name == "问候"
+
+
+def test_legacy_bundle_stays_atomic():
+    plan = BroadcastPlan.model_validate(
+        {
+            "contacts": ["海鸟与鱼"],
+            "sequence": [{"type": "bundle", "bundle_id": "b1"}],
+        }
+    )
+    bundle = plan.sequence[0]
+    assert bundle.presentation == "atomic"
+    assert bundle.items == []
+    assert plan.name == ""
+
+
+def test_at_and_notice_steps_roundtrip(tmp_path: Path):
+    plan = BroadcastPlan.model_validate(
+        _valid_payload(
+            sequence=[
+                {"type": "at", "body": "大家好"},
+                {"type": "notice", "template_id": "tpl-1", "variant_pick": "index:0", "display_name": "周公告"},
+            ],
+            step_gaps=[3.0],
+        )
+    )
+    assert [step.type for step in plan.sequence] == ["at", "notice"]
+    assert step_status(plan.sequence[0]) == "ready"
+    assert step_status(plan.sequence[1]) == "ready"
+    dest = tmp_path / "plan.json"
+    save_plan(plan, dest)
+    loaded = load_plan(dest)
+    assert loaded.sequence[0].body == "大家好"
+    assert loaded.sequence[1].template_id == "tpl-1"
+    assert loaded.sequence[1].display_name == "周公告"
+
+
+def test_at_step_requires_body_or_template():
+    with pytest.raises(ValidationError):
+        BroadcastPlan.model_validate(_valid_payload(sequence=[{"type": "at"}], step_gaps=[]))

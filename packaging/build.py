@@ -4,6 +4,7 @@
 GUI 交付物（--gui-only）：
     dist/企微客户自动化管理工具.exe
     dist/vendor/ffmpeg/ffmpeg.exe
+    dist/vendor/silk/silk_v3_decoder.exe
     dist/vendor/frida-server-16.7.19-android-x86_64
     dist/vendor/adb.exe            # Google 官方 platform-tools
     dist/vendor/AdbWinApi.dll      # adb.exe 运行时依赖
@@ -24,6 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PACKAGING = ROOT / "packaging"
 SPEC_GUI = PACKAGING / "wecom-voice-blaster-gui.spec"
 FFMPEG = ROOT / "vendor" / "ffmpeg" / "ffmpeg.exe"
+SILK_DECODER = ROOT / "vendor" / "silk" / "silk_v3_decoder.exe"
 FRIDA_SERVER = ROOT / "vendor" / "frida-server-16.7.19-android-x86_64"
 ADB_EXE = ROOT / "vendor" / "adb.exe"
 ADB_DLLS = [
@@ -80,6 +82,10 @@ def _prepare_gui_delivery() -> None:
     _copy_required_file(
         FFMPEG,
         dist_dir / "vendor" / "ffmpeg" / "ffmpeg.exe",
+    )
+    _copy_required_file(
+        SILK_DECODER,
+        dist_dir / "vendor" / "silk" / "silk_v3_decoder.exe",
     )
     _copy_required_file(
         FRIDA_SERVER,

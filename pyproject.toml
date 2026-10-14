@@ -1,6 +1,6 @@
 [project]
 name = "wecom-voice-blaster"
-version = "0.1.0"
+version = "0.1.1"
 description = "企业微信客户消息工具（安卓模拟器 + Frida）"
 requires-python = ">=3.10"
 readme = "README.md"
@@ -14,6 +14,7 @@ dependencies = [
   "PySide6>=6.8.0",
   "frida==16.7.19",
   "APScheduler>=3.10.4",
+  "pywin32>=306",
 ]
 
 # `pip install -e .` 之后, 可直接用这两个入口

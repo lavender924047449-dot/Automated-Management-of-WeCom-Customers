@@ -8,6 +8,8 @@ import sys
 from typing import Any
 
 _CREATE_NO_WINDOW = 0x08000000
+_CREATE_NEW_CONSOLE = 0x00000010
+_SW_HIDE = 0
 
 # 保活：patch 只装一次
 _GLOBAL_PATCH_INSTALLED = False
@@ -39,10 +41,9 @@ def install_global_no_window_patch() -> bool:
 
     做法
     ----
-    在 Windows 上 monkey-patch ``subprocess.Popen.__init__``，如果调用方没有显式
-    指定 ``creationflags``，就自动 or 上 CREATE_NO_WINDOW。调用方显式传了
-    creationflags 的（比如需要 CREATE_NEW_CONSOLE / DETACHED_PROCESS 的特殊场景）
-    则完全不干预，尊重原意。
+    在 Windows 上 monkey-patch ``subprocess.Popen.__init__``：只要调用方没有
+    要求 CREATE_NEW_CONSOLE，就补上 CREATE_NO_WINDOW，并隐藏启动窗口。
+    只设 CREATE_NO_WINDOW 时，控制台程序（尤其是 adb.exe）仍可能闪一下黑框。
 
     幂等；非 Windows 直接返回 False；返回 True 表示已安装。
     """
@@ -55,9 +56,17 @@ def install_global_no_window_patch() -> bool:
     original_init = subprocess.Popen.__init__
 
     def _patched_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        # 调用方显式传了 creationflags → 尊重（可能是 CREATE_NEW_CONSOLE 之类）
-        if kwargs.get("creationflags") is None or kwargs.get("creationflags") == 0:
-            kwargs["creationflags"] = _CREATE_NO_WINDOW
+        # 控制台程序（adb.exe、python.exe）在 GUI 进程里被拉起时，只设
+        # CREATE_NO_WINDOW 仍可能闪一下黑框。再强制隐藏启动窗口。
+        # 调用方明确要新控制台时不干预。
+        flags = int(kwargs.get("creationflags") or 0)
+        if not flags & _CREATE_NEW_CONSOLE:
+            kwargs["creationflags"] = flags | _CREATE_NO_WINDOW
+            if kwargs.get("startupinfo") is None:
+                startup = subprocess.STARTUPINFO()
+                startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startup.wShowWindow = _SW_HIDE
+                kwargs["startupinfo"] = startup
         # 中文 Windows 上 text=True 默认按 GBK 解码。adb / 设备路径是 UTF-8，
         # 文件名一带中文，读 stdout 的线程就会 UnicodeDecodeError，采集直接断掉。
         text_mode = bool(kwargs.get("text") or kwargs.get("universal_newlines"))

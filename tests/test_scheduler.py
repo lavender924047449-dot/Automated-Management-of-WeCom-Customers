@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from app.broadcast.schedule_spec import AfterSpec, AtSpec, CronSpec, ImmediateSpec
-from app.broadcast.scheduler import BroadcastScheduler, parse_cron_expr
+from app.broadcast.scheduler import BroadcastScheduler, cron_expr_label, next_cron_fire, parse_cron_expr
 
 
 class _FakeBackend:
@@ -37,6 +37,16 @@ class _FakeBackend:
 
 def _fixed_now() -> datetime:
     return datetime(2026, 9, 16, 19, 20, 0)
+
+
+def test_cron_label_and_next_fire():
+    assert cron_expr_label("daily@09:05") == "每天 09:05"
+    assert cron_expr_label("weekly@3/18:00") == "每周三 18:00"
+    wednesday_morning = datetime(2026, 9, 30, 8, 0, 0)  # Wednesday
+    assert next_cron_fire("daily@09:00", wednesday_morning) == datetime(2026, 9, 30, 9, 0, 0)
+    assert next_cron_fire("daily@09:00", datetime(2026, 9, 30, 9, 0, 0)) == datetime(2026, 10, 1, 9, 0, 0)
+    assert next_cron_fire("weekly@3/18:00", wednesday_morning) == datetime(2026, 9, 30, 18, 0, 0)
+    assert next_cron_fire("weekly@3/08:00", wednesday_morning) == datetime(2026, 10, 7, 8, 0, 0)
 
 
 def test_parse_cron_expr_daily_and_weekly():
@@ -73,6 +83,8 @@ def test_schedule_triggers_and_timing(tmp_path: Path):
     assert c_job["trigger"] == "cron"
     assert c_job["kwargs"]["hour"] == 19
     assert c_job["kwargs"]["minute"] == 30
+    assert c_job["kwargs"]["args"] == [c.id]
+    c_job["func"](*c_job["kwargs"]["args"])
 
 
 def test_schedule_spec_submit_and_roundtrip(tmp_path: Path):

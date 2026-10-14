@@ -21,6 +21,7 @@ hidden += collect_submodules("app")
 # __runmod__ 动态 importlib.import_module 起来；不显式收集的话打包时 PyInstaller
 # 追不到依赖，运行时子命令直接 ModuleNotFoundError → 联系人/发送/采集全崩。
 hidden += collect_submodules("runtime")
+hidden += collect_submodules("apscheduler")
 hidden += [
     "loguru", "pydantic", "yaml", "PIL",
     "PySide6",
@@ -59,6 +60,21 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+# Codex 运行库和 Python 3.11 自带的 VCRUNTIME 14.38 会被打进包根目录。
+# Qt 6.11 需要 14.44；根目录里的旧 DLL 或 api-ms-win-crt 桩一加载，
+# 导入 QtWidgets 就会报「找不到指定的程序」。
+def _keep_binary(item):
+    dest, src = item[0], item[1]
+    src_norm = str(src).replace("/", "\\").lower()
+    if "codex-runtimes" in src_norm or "codex-pytest" in src_norm:
+        return False
+    dest_name = str(dest).replace("/", "\\").split("\\")[-1].lower()
+    if "\\python311\\" in src_norm and dest_name in {"vcruntime140.dll", "vcruntime140_1.dll"}:
+        return False
+    return True
+
+a.binaries = [item for item in a.binaries if _keep_binary(item)]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 

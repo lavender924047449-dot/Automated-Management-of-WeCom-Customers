@@ -26,7 +26,6 @@ class VoiceLibraryEntry(BaseModel):
     captured_at: str
     note: str = ""
     label: str = ""
-    usage_count: int = Field(default=0, ge=0)
     is_archived: bool = False
 
     @field_validator("id", "file", "captured_at", "note", "label")
@@ -96,7 +95,6 @@ class VoiceLibrary:
         note: str = "",
         label: str = "",
         captured_at: str | None = None,
-        usage_count: int = 0,
     ) -> VoiceLibraryEntry:
         ts = captured_at or datetime.now().isoformat(timespec="seconds")
         entry = VoiceLibraryEntry(
@@ -106,7 +104,6 @@ class VoiceLibrary:
             captured_at=ts,
             note=note,
             label=label,
-            usage_count=usage_count,
         )
         self._entries.append(entry)
         return entry
@@ -125,11 +122,6 @@ class VoiceLibrary:
     def update_note(self, entry_id: str, note: str) -> VoiceLibraryEntry:
         entry = self._find(entry_id)
         entry.note = note.strip()
-        return entry
-
-    def bump_usage(self, entry_id: str, delta: int = 1) -> VoiceLibraryEntry:
-        entry = self._find(entry_id)
-        entry.usage_count = max(0, entry.usage_count + int(delta))
         return entry
 
     def archive(self, entry_id: str) -> VoiceLibraryEntry:
@@ -182,6 +174,7 @@ class VoiceLibrary:
         template_id: str | None = None,
         is_archived: bool = False,
         kind: Literal["text", "link"] = "text",
+        unnamed: bool = False,
     ) -> "TextTemplate":
         tag_list = list(tags or [])
         template = TextTemplate(
@@ -191,6 +184,7 @@ class VoiceLibrary:
             tags=tag_list,
             is_archived=bool(is_archived),
             kind=kind,
+            unnamed=bool(unnamed),
         )
         self._text_templates.append(template)
         return template
@@ -227,6 +221,7 @@ class VoiceLibrary:
         template = self._find_text_template(template_id)
         if name is not None:
             template.name = _strip_nonempty(name, "name")
+            template.unnamed = False
         if variants is not None:
             template.variants = _normalize_variants(variants)
         if tags is not None:
@@ -358,6 +353,8 @@ class TextTemplate(BaseModel):
     # 默认 "text" 保证既有 text_templates.json（无该字段）向前兼容：
     # Pydantic 反序列化老数据时自动补 "text"。
     kind: Literal["text", "link"] = "text"
+    # 传输助手抓到、尚未双击命名的文字。旧数据没有该字段，按已命名处理。
+    unnamed: bool = False
     created_at: str = Field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     updated_at: str = Field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 

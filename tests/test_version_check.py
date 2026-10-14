@@ -62,5 +62,26 @@ def test_check_latest_version_handles_network_error(monkeypatch):
     assert "network down" in out.error
 
 
+def test_check_latest_version_reads_program_update_asset(monkeypatch):
+    payload = {
+        "tag_name": "v0.2.0",
+        "html_url": "https://github.com/org/Test-Voice/releases/tag/v0.2.0",
+        "assets": [
+            {
+                "name": "program-update.zip",
+                "browser_download_url": "https://github.com/org/Test-Voice/releases/download/v0.2.0/program-update.zip",
+            }
+        ],
+    }
+
+    def fake_urlopen(_req, timeout=0):  # noqa: ARG001
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(vc, "urlopen", fake_urlopen)
+    out = vc.check_latest_version(current_version="0.1.0", api_url="https://api.github.com/repos/org/Test-Voice/releases/latest")
+    assert out.asset_name == "program-update.zip"
+    assert out.asset_url.endswith("/program-update.zip")
+
+
 def test_version_key_compares_numeric_parts():
     assert vc._version_key("v1.10.0") > vc._version_key("1.2.9")

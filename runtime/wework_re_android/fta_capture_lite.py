@@ -62,9 +62,13 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.bootstrap.win_subprocess import install_global_no_window_patch
 from app.broadcast.paths import account_voice_index_path
 from app.security import get_secure_store
 from runtime.wework_re_android._frida_env import adb_binary
+
+# 采集进程会多次调用 adb.exe。父界面的无窗口补丁不会带进这个子进程。
+install_global_no_window_patch()
 
 # stdout jsonl schema 版本；破坏性变更需 ++，详见 notes/fta_capture_protocol.md
 EVENT_SCHEMA_VERSION = 1
@@ -86,7 +90,8 @@ MTYPE_IMAGE = {7, 14}
 MTYPE_VIDEO = {5, 23, 43, 62}  # F3.5 修：当前企微 GUI 发视频实际 mType=5（真机联调实测，
 # 见 runtime/artifacts/fta_lite_last.jsonl），旧 {23,43,62} 属于历史 probe 覆盖，
 # 不删是为了兼容不同版本；5 不与 voice/image/oa 冲突。
-MTYPE_OA = {13, 78}
+MTYPE_OA = {13}
+MTYPE_WXA = {78}
 # 上游 hook 关联窗口：F1.7 实测 voice = 10s；probe 侧 video/oa = 15s
 UPSTREAM_WINDOW_MS_DEFAULT = 15000
 
@@ -207,14 +212,172 @@ Java.perform(function () {
         try { return JString.$new(b, 'UTF-8').toString(); } catch (_) { return ''; }
     }
 
+    function readContentType(info) {
+        if (!info) return -1;
+        try { return info.contentType.value | 0; } catch (_) {}
+        try { return parseInt(String(info.contentType), 10) || -1; } catch (_) {}
+        return -1;
+    }
+
+    function toJsBytes(javaBytes) {
+        if (!javaBytes) return [];
+        var n = 0;
+        try { n = javaBytes.length | 0; } catch (_) { return []; }
+        var out = new Array(n);
+        for (var i = 0; i < n; i++) {
+            var b = javaBytes[i];
+            out[i] = (b < 0) ? (b + 256) : (b & 255);
+        }
+        return out;
+    }
+
+    function jsBytesToJava(list) {
+        var out = Java.array('byte', Array(list.length).fill(0));
+        for (var i = 0; i < list.length; i++) {
+            var v = list[i] & 255;
+            out[i] = v > 127 ? v - 256 : v;
+        }
+        return out;
+    }
+
+    function readVarint(bytes, offset) {
+        var value = 0;
+        var shift = 0;
+        var i = offset;
+        while (i < bytes.length && shift <= 28) {
+            var b = bytes[i] & 255;
+            i++;
+            value += (b & 127) * Math.pow(2, shift);
+            if ((b & 128) === 0) return { value: value, offset: i };
+            shift += 7;
+        }
+        return null;
+    }
+
+    function protoLenFields(bytes, fieldNum) {
+        var found = [];
+        var i = 0;
+        while (i < bytes.length) {
+            var key = readVarint(bytes, i);
+            if (!key) break;
+            i = key.offset;
+            var field = Math.floor(key.value / 8);
+            var wire = key.value % 8;
+            if (wire === 0) {
+                var n = readVarint(bytes, i);
+                if (!n) break;
+                i = n.offset;
+            } else if (wire === 1) {
+                i += 8;
+            } else if (wire === 5) {
+                i += 4;
+            } else if (wire === 2) {
+                var ln = readVarint(bytes, i);
+                if (!ln) break;
+                i = ln.offset;
+                var size = ln.value;
+                if (size < 0 || i + size > bytes.length) break;
+                if (field === fieldNum) found.push(bytes.slice(i, i + size));
+                i += size;
+            } else {
+                break;
+            }
+        }
+        return found;
+    }
+
+    function findWeappBody(bytes) {
+        if (!bytes || !bytes.length) return null;
+        var wrappers = protoLenFields(bytes, 10);
+        for (var i = 0; i < wrappers.length; i++) {
+            var inner = protoLenFields(wrappers[i], 107);
+            if (inner.length && inner[0].length >= 8) return inner[0];
+        }
+        var direct = protoLenFields(bytes, 107);
+        if (direct.length && direct[0].length >= 8) return direct[0];
+        return null;
+    }
+
+    function readDeclaredText(obj, name) {
+        if (!obj) return '';
+        try {
+            var f = obj.getClass().getDeclaredField(name);
+            f.setAccessible(true);
+            var v = f.get(obj);
+            if (v === null || v === undefined) return '';
+            var t = String(f.getType().getName());
+            if (t === '[B') {
+                try { return String(JString.$new(v, 'UTF-8')); } catch (_) { return ''; }
+            }
+            return String(v);
+        } catch (_) {
+            return '';
+        }
+    }
+
+    // contentType 78：WwMessage 字段 10 里的字段 107 才是 WeAppMessage。
+    // 不能按 LinkMessage 解析，否则会把小程序收成公众号卡片。
+    function parseWxaCard(msg, force) {
+        if (!msg) return null;
+        var info = null;
+        try { info = msg.getInfo(); } catch (_) { return null; }
+        if (!info) return null;
+        var ct = readContentType(info);
+        if (ct === 13) return null;
+        if (ct !== 78 && !force) return null;
+        var raw = null;
+        try {
+            var MN = Java.use('com.google.protobuf.nano.MessageNano');
+            var toBytes = MN.toByteArray.overload('com.google.protobuf.nano.MessageNano');
+            raw = toBytes.call(MN, info);
+        } catch (_) { raw = null; }
+        var body = findWeappBody(toJsBytes(raw));
+        if (!body) {
+            try { body = findWeappBody(toJsBytes(info.content.value)); } catch (_) { body = null; }
+        }
+        if (!body || body.length < 8) return null;
+        var javaBody = jsBytesToJava(body);
+        var b64 = '';
+        try {
+            var Base64 = Java.use('android.util.Base64');
+            b64 = String(Base64.encodeToString(javaBody, 2));
+        } catch (_) {
+            return null;
+        }
+        var card = {
+            weappBodyB64: b64,
+            username: '',
+            pagepath: '',
+            title: '',
+            appName: '',
+            weappIconUrl: '',
+            desc: '',
+            type: '2'
+        };
+        try {
+            var WeApp = Java.use('com.tencent.wework.foundation.model.pb.WeAppMessageProto$WeAppMessage');
+            var app = WeApp.parseFrom.overload('[B').call(WeApp, javaBody);
+            card.username = readDeclaredText(app, 'username');
+            card.pagepath = readDeclaredText(app, 'pagepath');
+            card.title = readDeclaredText(app, 'title');
+            card.appName = readDeclaredText(app, 'appName');
+            card.weappIconUrl = readDeclaredText(app, 'weappIconUrl');
+            card.desc = readDeclaredText(app, 'desc');
+            var typeText = readDeclaredText(app, 'type');
+            if (typeText) card.type = typeText;
+        } catch (_) {}
+        return card;
+    }
+
     // 从 Message 直接解析公众号 LinkMessage 干净字段；失败返回 null。
+    // 只接受 contentType 13。78 是小程序，走 parseWxaCard。
     function parseOaLinkMessage(msg) {
         if (!LinkMsgProto || !msg) return null;
         try {
             var info = msg.getInfo();
             if (!info) return null;
-            var ct = info.contentType.value;
-            if (ct !== 13 && ct !== 78) return null;
+            var ct = readContentType(info);
+            if (ct !== 13) return null;
             var content = info.content.value;
             if (!content) return null;
             var lm = LinkMsgProto.parseFrom(content);
@@ -226,6 +389,128 @@ Java.perform(function () {
                 appname: String(lm.appname.value || '')
             };
         } catch (_) { return null; }
+    }
+
+    // 企微文字：mType 0/1 的 content 是 TextMessage（field 1 = 正文）；
+    // mType 2 是 RichMessage，正文嵌在子消息的 field 2 里。
+    function looksLikeHumanText(s) {
+        if (!s) return false;
+        var t = String(s);
+        if (!t || t.length > 8000) return false;
+        if (t.indexOf('\uFFFD') >= 0 || t.indexOf('com.tencent.') >= 0) return false;
+        var visible = 0;
+        for (var i = 0; i < t.length; i++) {
+            var c = t.charCodeAt(i);
+            if (c === 0) return false;
+            if (c < 32 && c !== 9 && c !== 10 && c !== 13) return false;
+            if (c > 32) visible++;
+        }
+        return visible > 0;
+    }
+
+    function utf8FromJsBytes(list) {
+        if (!list || !list.length || !JString) return '';
+        try { return String(JString.$new(jsBytesToJava(list), 'UTF-8')); } catch (_) { return ''; }
+    }
+
+    function textFromKnownProto(content) {
+        var names = [
+            'com.tencent.wework.foundation.model.pb.WwRichmessage$TextMessage',
+            'com.tencent.wework.foundation.model.pb.WwRichmessageBase$TextMessage'
+        ];
+        for (var i = 0; i < names.length; i++) {
+            try {
+                var TM = Java.use(names[i]);
+                var tm = TM.parseFrom.overload('[B').call(TM, content);
+                var text = readDeclaredText(tm, 'content') || readDeclaredText(tm, 'content_');
+                text = String(text || '').replace(/^\s+|\s+$/g, '');
+                if (looksLikeHumanText(text)) return text.length > 4000 ? text.substring(0, 4000) : text;
+            } catch (_) {}
+        }
+        return '';
+    }
+
+    function textIfFieldOne(bytes) {
+        if (!bytes || !bytes.length || (bytes[0] & 7) !== 2) return '';
+        var parts = protoLenFields(bytes, 1);
+        if (parts.length !== 1) return '';
+        var text = String(utf8FromJsBytes(parts[0]) || '').replace(/^\s+|\s+$/g, '');
+        if (!looksLikeHumanText(text)) return '';
+        return text.length > 4000 ? text.substring(0, 4000) : text;
+    }
+
+    function extractTextPieces(bytes, depth) {
+        if (!bytes || !bytes.length || depth > 6) return [];
+        var direct = textIfFieldOne(bytes);
+        if (direct) return [direct];
+        var pieces = [];
+        var i = 0;
+        while (i < bytes.length) {
+            var key = readVarint(bytes, i);
+            if (!key) return pieces;
+            i = key.offset;
+            var wire = key.value % 8;
+            if (wire === 0) {
+                var n = readVarint(bytes, i);
+                if (!n) return pieces;
+                i = n.offset;
+            } else if (wire === 1) {
+                if (i + 8 > bytes.length) return pieces;
+                i += 8;
+            } else if (wire === 5) {
+                if (i + 4 > bytes.length) return pieces;
+                i += 4;
+            } else if (wire === 2) {
+                var ln = readVarint(bytes, i);
+                if (!ln) return pieces;
+                i = ln.offset;
+                var size = ln.value;
+                if (size < 0 || i + size > bytes.length) return pieces;
+                var chunk = bytes.slice(i, i + size);
+                i += size;
+                var nested = extractTextPieces(chunk, depth + 1);
+                for (var p = 0; p < nested.length; p++) pieces.push(nested[p]);
+            } else {
+                return pieces;
+            }
+        }
+        return pieces;
+    }
+
+    function extractPlainText(msg) {
+        if (!msg) return '';
+        var info = null;
+        try { info = msg.getInfo(); } catch (_) { return ''; }
+        if (!info) return '';
+        var content = null;
+        try { content = info.content.value; } catch (_) { content = null; }
+        if (!content) return '';
+        var fromClass = textFromKnownProto(content);
+        if (fromClass) return fromClass;
+        var pieces = extractTextPieces(toJsBytes(content), 0);
+        if (!pieces.length) return '';
+        var joined = '';
+        for (var pi = 0; pi < pieces.length; pi++) joined += pieces[pi];
+        joined = joined.replace(/^\s+|\s+$/g, '');
+        if (!looksLikeHumanText(joined)) return '';
+        return joined.length > 4000 ? joined.substring(0, 4000) : joined;
+    }
+
+    function emitPlainText(ids, msg, mType, t0) {
+        var textBody = extractPlainText(msg);
+        if (!textBody) {
+            send({ event: 'dispatch_miss', kind: 'text', mType: mType, tsMs: t0 });
+            return;
+        }
+        send({
+            event: 'fta_text_seen',
+            convLocal: ids.local,
+            convRemote: ids.remote || FTA_REMOTE_ID,
+            body: textBody,
+            mType: mType,
+            tsMs: t0,
+            hookElapsedMs: Date.now() - t0
+        });
     }
 
     // 路径 → 素材类型；被多个 hook 复用（U1/V1/q8）
@@ -1069,8 +1354,12 @@ Java.perform(function () {
                     hookElapsedMs: Date.now() - t0
                 });
 
+                // 文字：在传输助手输入框发出的纯文本 / 富文本。
+                if (mType === 0 || mType === 1 || mType === 2) {
+                    emitPlainText(ids, msg, mType, t0);
+                }
                 // voice
-                if (mType === 9 && pendingVoices.length > 0) {
+                else if (mType === 9 && pendingVoices.length > 0) {
                     var voice = pendingVoices[pendingVoices.length - 1];
                     send({
                         event: 'fta_voice_seen',
@@ -1145,8 +1434,53 @@ Java.perform(function () {
                         send({ event: 'fta_video_seen', convLocal: ids.local, convRemote: ids.remote, videoPath: vpath, thumbPath: tpath, source: vSource, tsMs: t0, hookElapsedMs: Date.now() - t0 });
                     }
                 }
-                // oa/wxa: 先用 pending buffer；否则反射 msg 兜底
-                else if (mType === 13 || mType === 78) {
+                // 小程序 contentType 78。禁止并入公众号：字段在 WeAppMessage，不在 LinkMessage。
+                else if (mType === 78) {
+                    var wxa = parseWxaCard(msg, true);
+                    if (wxa && wxa.weappBodyB64) {
+                        send({
+                            event: 'fta_wxa_seen',
+                            convLocal: ids.local,
+                            convRemote: ids.remote,
+                            mType: 78,
+                            username: wxa.username,
+                            pagepath: wxa.pagepath,
+                            title: wxa.title,
+                            appName: wxa.appName,
+                            weappIconUrl: wxa.weappIconUrl,
+                            desc: wxa.desc,
+                            type: wxa.type,
+                            weappBodyB64: wxa.weappBodyB64,
+                            source: 'proto',
+                            tsMs: t0,
+                            hookElapsedMs: Date.now() - t0
+                        });
+                    } else {
+                        send({ event: 'dispatch_miss', kind: 'wxa', mType: mType, tsMs: t0 });
+                    }
+                }
+                // 公众号 contentType 13
+                else if (mType === 13) {
+                    var wxaOnOaType = parseWxaCard(msg, false);
+                    if (wxaOnOaType && wxaOnOaType.weappBodyB64) {
+                        send({
+                            event: 'fta_wxa_seen',
+                            convLocal: ids.local,
+                            convRemote: ids.remote,
+                            mType: 78,
+                            username: wxaOnOaType.username,
+                            pagepath: wxaOnOaType.pagepath,
+                            title: wxaOnOaType.title,
+                            appName: wxaOnOaType.appName,
+                            weappIconUrl: wxaOnOaType.weappIconUrl,
+                            desc: wxaOnOaType.desc,
+                            type: wxaOnOaType.type,
+                            weappBodyB64: wxaOnOaType.weappBodyB64,
+                            source: 'proto',
+                            tsMs: t0,
+                            hookElapsedMs: Date.now() - t0
+                        });
+                    } else {
                     var oa = latestInWindow(pendingOas, t0, UPSTREAM_WINDOW_MS);
                     var link = oa ? oa.link : '';
                     var title = oa ? oa.title : '';
@@ -1188,6 +1522,7 @@ Java.perform(function () {
                     }
                     if (link || title) {
                         send({ event: 'fta_oa_seen', convLocal: ids.local, convRemote: ids.remote, link: link, title: title, desc: desc, imgUrl: imgUrl, appname: oaAppname, hasImgData: hasImg, source: oaSource, tsMs: t0, hookElapsedMs: Date.now() - t0 });
+                    }
                     }
                 }
                 else {
@@ -1258,7 +1593,9 @@ Java.perform(function () {
                         hookElapsedMs: Date.now() - t0
                     });
 
-                    if (mType === 7 || mType === 14) {
+                    if (ids.remote === FTA_REMOTE_ID && (mType === 0 || mType === 1 || mType === 2)) {
+                        emitPlainText(ids, msg, mType, t0);
+                    } else if (mType === 7 || mType === 14) {
                         var img = latestInWindow(pendingImages, t0, UPSTREAM_WINDOW_MS);
                         if (img) {
                             send({ event: 'fta_image_seen', convLocal: ids.local, convRemote: ids.remote || FTA_REMOTE_ID, sourcePath: img.path, mType: mType, source: 'pending:ConversationRef', tsMs: t0, hookElapsedMs: Date.now() - t0 });
@@ -1381,10 +1718,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_pid(adb: str, adb_serial: str, process_name: str) -> int | None:
-    raw = subprocess.check_output(
-        [adb, "-s", adb_serial, "shell", "ps -A -o PID,NAME"]
-    ).decode("ascii", "replace")
-    for line in raw.splitlines():
+    proc = subprocess.run(
+        [adb, "-s", adb_serial, "shell", "ps -A -o PID,NAME"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        print(
+            f"[fta_lite] find_pid failed serial={adb_serial}: {err or proc.returncode}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    for line in (proc.stdout or "").splitlines():
         p = line.split()
         if len(p) >= 2 and p[1] == process_name:
             return int(p[0])
@@ -1424,7 +1774,6 @@ def add_index_entry(rows: list[dict[str, Any]], file: str, duration: int) -> dic
         # note/label 都留空，展示层用 "未命名 #NNN" 占位（决策 F9）
         "note": "",
         "label": "",
-        "usage_count": 0,
     }
     rows.append(entry)
     return entry
@@ -1650,9 +1999,51 @@ def main() -> int:  # noqa: C901
     diag_path = Path(args.diag_log_path).resolve() if args.diag_log_path else None
     sink = _EventSink(emit_jsonl=args.emit_jsonl, diag_log_path=diag_path)
 
+    from app.bootstrap.runtime_bootstrap import ensure_adb_serial, ensure_frida_forward
+
+    configured_serial = str(args.adb_serial or "").strip()
+
+    def _bind_live_serial() -> str:
+        serial = ensure_adb_serial(adb, configured_serial)
+        if not serial:
+            return ""
+        if serial != args.adb_serial:
+            print(
+                f"[fta_lite] adb serial {args.adb_serial} offline, using {serial}",
+                file=sys.stderr,
+                flush=True,
+            )
+        args.adb_serial = serial
+        code, out = ensure_frida_forward(adb, serial)
+        if code != 0:
+            print(
+                f"[fta_lite] adb forward failed serial={serial}: {out or code}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return serial
+
+    if not _bind_live_serial():
+        sink.emit(
+            "error",
+            stage="adb_connect",
+            message=f"device offline: {configured_serial}",
+        )
+        sink.close()
+        return 2
+
     pid = find_pid(adb, args.adb_serial, args.process_name)
     if pid is None:
-        sink.emit("error", stage="find_pid", message=f"process not found: {args.process_name}")
+        # 列出设备之后、ps 之前传输可能又掉了，再连一次。
+        _bind_live_serial()
+        pid = find_pid(adb, args.adb_serial, args.process_name)
+    if pid is None:
+        sink.emit(
+            "error",
+            stage="find_pid",
+            message=f"process not found: {args.process_name} serial={args.adb_serial}",
+        )
+        sink.close()
         return 2
 
     # F2.2：--index-path 显式优先；否则按 --account-id 派生（与 GUI 账号隔离对齐）
@@ -1702,6 +2093,34 @@ def main() -> int:  # noqa: C901
             sourcePath=source_path,
             dstPath=dst_path,
             size=size,
+            convLocal=payload.get("convLocal", ""),
+            convRemote=payload.get("convRemote", ""),
+            dryCopy=args.dry_copy,
+        )
+
+    def _handle_text_seen(payload: dict[str, Any]) -> None:
+        from app.broadcast.library import VoiceLibrary
+
+        body = str(payload.get("body") or "").strip()
+        if not body:
+            sink.emit("capture_failed", kind="text", reason="empty_body")
+            return
+        tid = str(uuid.uuid4())
+        with io_lock:
+            lib = VoiceLibrary.load(account_id=args.account_id or None)
+            lib.add_text_template(
+                name=tid,
+                variants=[body],
+                template_id=tid,
+                kind="text",
+                unnamed=True,
+            )
+            lib.save()
+        sink.emit(
+            "captured",
+            kind="text",
+            id=tid,
+            preview=body,
             convLocal=payload.get("convLocal", ""),
             convRemote=payload.get("convRemote", ""),
             dryCopy=args.dry_copy,
@@ -1906,11 +2325,68 @@ def main() -> int:  # noqa: C901
             dryCopy=args.dry_copy,
         )
 
+    def _handle_wxa_seen(payload: dict[str, Any]) -> None:
+        from app.broadcast import wxa_templates as wtpl
+        from app.broadcast.wxa_templates import has_card_fields
+
+        tid = str(uuid.uuid4())
+        raw_type = payload.get("type")
+        try:
+            wxa_type = int(raw_type)
+        except (TypeError, ValueError):
+            wxa_type = 2
+        body = {
+            "template_id": tid,
+            "name": "",
+            "tags": [],
+            "unnamed": True,
+            "msgType": 78,
+            "username": str(payload.get("username") or ""),
+            "pagepath": str(payload.get("pagepath") or ""),
+            "title": str(payload.get("title") or ""),
+            "appName": str(payload.get("appName") or ""),
+            "weappIconUrl": str(payload.get("weappIconUrl") or ""),
+            "desc": str(payload.get("desc") or ""),
+            "type": wxa_type,
+            "weappBodyB64": str(payload.get("weappBodyB64") or ""),
+            "captured_from": {
+                "convLocal": payload.get("convLocal", ""),
+                "convRemote": payload.get("convRemote", ""),
+                "event": "fta_wxa_seen",
+            },
+        }
+        if not has_card_fields(body):
+            sink.emit("capture_failed", kind="wxa", reason="missing_card_fields")
+            return
+        try:
+            wtpl.save_template(body, template_id=tid, account_id=args.account_id, pending=False)
+        except Exception as exc:  # noqa: BLE001
+            sink.emit("capture_failed", kind="wxa", reason=f"save_template_failed:{exc}")
+            return
+        sink.emit(
+            "captured",
+            kind="wxa",
+            id=tid,
+            title=body["title"],
+            appName=body["appName"],
+            username=body["username"],
+            convLocal=payload.get("convLocal", ""),
+            convRemote=payload.get("convRemote", ""),
+            dryCopy=args.dry_copy,
+        )
+
     def _handle_oa_seen(payload: dict[str, Any]) -> None:
         # oa 没有本地文件，只是结构化字段（link/title/desc/imgUrl）——直接 dump JSON。
         from app.broadcast import oa_templates as otpl
 
         tid = str(uuid.uuid4())
+        from app.broadcast.link_cards import classify_link_card
+
+        url = str(payload.get("link", ""))
+        title = str(payload.get("title", ""))
+        desc = str(payload.get("desc", ""))
+        appname = str(payload.get("appname", ""))
+        card_kind = classify_link_card(url=url, title=title, desc=desc, appname=appname)
         body = {
             "template_id": tid,
             "name": "",
@@ -1918,10 +2394,11 @@ def main() -> int:  # noqa: C901
             "unnamed": True,
             "msgType": 13,
             "appMsgType": 5,
-            "url": str(payload.get("link", "")),
-            "title": str(payload.get("title", "")),
-            "desc": str(payload.get("desc", "")),
-            "sourcename": str(payload.get("appname", "")),
+            "card_kind": card_kind,
+            "url": url,
+            "title": title,
+            "desc": desc,
+            "sourcename": appname,
             "thumburl": str(payload.get("imgUrl", "")),
             "hasImgData": bool(payload.get("hasImgData", False)),
             "captured_from": {
@@ -1933,11 +2410,11 @@ def main() -> int:  # noqa: C901
         try:
             otpl.save_template(body, template_id=tid, account_id=args.account_id, pending=False)
         except Exception as exc:  # noqa: BLE001
-            sink.emit("capture_failed", kind="oa", reason=f"save_template_failed:{exc}")
+            sink.emit("capture_failed", kind=card_kind, reason=f"save_template_failed:{exc}")
             return
         sink.emit(
             "captured",
-            kind="oa",
+            kind=card_kind,
             id=tid,
             title=body["title"],
             url=body["url"],
@@ -2021,6 +2498,9 @@ def main() -> int:  # noqa: C901
         if event == "fta_voice_seen":
             executor.submit(_handle_voice_seen, payload)
             return
+        if event == "fta_text_seen":
+            executor.submit(_handle_text_seen, payload)
+            return
         if event == "fta_image_seen":
             executor.submit(_handle_image_seen, payload)
             return
@@ -2029,6 +2509,9 @@ def main() -> int:  # noqa: C901
             return
         if event == "fta_oa_seen":
             executor.submit(_handle_oa_seen, payload)
+            return
+        if event == "fta_wxa_seen":
+            executor.submit(_handle_wxa_seen, payload)
             return
         if event == "error":
             errored["flag"] = True

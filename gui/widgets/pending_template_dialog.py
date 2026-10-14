@@ -42,7 +42,7 @@ class CardCopyDialog(QDialog):
         super().__init__(parent)
         self._payload = payload
         self._kind = kind
-        label = {"oa": "公众号图文卡片", "wxa": "小程序卡片"}.get(kind, kind)
+        label = {"oa": "公众号图文卡片", "wxa": "小程序"}.get(kind, kind)
         self.setWindowTitle(f"编辑{label}文案")
         self.setModal(True)
         self.resize(520, 320)
@@ -131,7 +131,7 @@ class PendingTemplateDialog(QDialog):
         self._decision = self.RESULT_DEFER
         title_prefix = {
             "oa": "公众号图文卡片",
-            "wxa": "小程序卡片",
+            "wxa": "小程序",
             "image": "图片素材",
             "video": "视频素材",
         }.get(kind, kind)
